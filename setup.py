@@ -34,7 +34,7 @@ setup(
     author_email='martin.raspaud@smhi.se',
     url="https://github.com/mraspaud/risotto",
     ext_modules=cythonize("risotto/_risotto.pyx"),
-    install_requires=['numpy', 'risotto'],
+    install_requires=['numpy', 'risotto', 'trollimage', 'joblib'],
     scripts=['bin/npp_reader.py'],
     classifiers=["Development Status :: 3 - Alpha",
                  "Intended Audience :: Science/Research",
