@@ -26,11 +26,11 @@ At the moment, only reading single gain predictor bands M12, M10, M9, M6, M16, M
 
 Mostly from
 
-Joint Polar Satellite System (JPSS) 
-Common Data Format Control Book – 
-External 
-Volume VII – Part I  
-JPSS Downlink Data Formats  
+Joint Polar Satellite System (JPSS)
+Common Data Format Control Book –
+External
+Volume VII – Part I
+JPSS Downlink Data Formats
 
 
 TODO:
@@ -42,12 +42,14 @@ TODO:
 """
 
 
-from datetime import datetime
-import numpy as np
 import sys
-from trollimage.image import Image
+from datetime import datetime
+
+import numpy as np
 from joblib import Parallel, delayed
+
 import risotto as rice
+from trollimage.image import Image
 
 #from reed import rs
 # from zfec import Decoder
@@ -80,6 +82,11 @@ table = np.array([0xff, 0x48, 0x0e, 0xc0, 0x9a, 0x0d, 0x70, 0xbc, 0x8e, 0x2c,
                   0x5e, 0x47, 0x16, 0x49, 0xd6, 0xd3, 0xdb, 0xa3, 0x67, 0x2d,
                   0x4b, 0xbe, 0xe6, 0x19, 0x51, 0x5f, 0x9f, 0x05, 0x08, 0x78,
                   0xc4, 0x4a, 0x66, 0xf5, 0x58], dtype=np.uint8)
+
+
+# Rice decoding parameters
+J = 8
+refblk = 128 * J
 
 
 def show(data, filename=None, stripes=0):
@@ -220,7 +227,7 @@ def get_vc(packets, req_vcid):
             yield hdr, packet
             cnt += 1
             if cnt % 10000 == 0:
-                #return
+                # return
                 print "vcdu packets read", cnt
 
 
@@ -352,6 +359,7 @@ detector_bef = np.dtype([('fill_data', '>u2'),
 detector_aft = np.dtype([('checksum', '>u4'),
                          ('sync_word', '>u4')])
 
+
 class SyncError(Exception):
     pass
 
@@ -435,7 +443,8 @@ def decode_line(middle_pack):
     offset += detector_aft.itemsize
     # aggr 6
     data_len = np.fromstring(middle_pack[offset:],
-                             dtype=detector_bef, count=1)["checksum_offset"][0] - 4
+                             dtype=detector_bef,
+                             count=1)["checksum_offset"][0] - 4
     offset += detector_bef.itemsize
     # data6 = np.fromstring(
     #    middle_pack[offset:offset + data_len], dtype=np.uint8)
@@ -451,20 +460,31 @@ def decode_line(middle_pack):
 
 
 def read6(filename, vcid, apids, pn=False):
-    """Read the data from *filename* for a given *vcid* and *apid*
-    """
+    """Read the data from *filename* for a given *vcid* and *apid*."""
     return data_packets(
-            get_aps(
-             ccsds_packets(
-              get_vc(
-               read_vcdu_hdr(
+        get_aps(
+            ccsds_packets(
+                get_vc(
+                    read_vcdu_hdr(
+                        reed_decode(
+                            pn_decode(
+                                frame_sync(
+                                    file_reader(filename)),
+                                skip=not pn))),
+                    vcid)),
+            apids))
+
+
+def ccsds_iterator(filename, vcid, pn=False):
+    return ccsds_packets(
+        get_vc(
+            read_vcdu_hdr(
                 reed_decode(
-                 pn_decode(
-                  frame_sync(
-                   file_reader(filename)),
-                  skip=not pn))),
-               vcid)),
-             apids))
+                    pn_decode(
+                        frame_sync(
+                            file_reader(filename)),
+                        skip=not pn))),
+            vcid))
 
 apids = {800: "M04",
          801: "M05",
@@ -498,6 +518,7 @@ channels = {v: k for k, v in apids.items()}
 dual = [800, 801, 802, 803, 804, 806, 811]
 single = [805, 807, 808, 809, 810, 812, 814, 815, 816]
 
+
 def build_scan(bunch, apid):
     """Convert the packet *bunch* into a scan.
     """
@@ -522,10 +543,11 @@ def build_scan(bunch, apid):
 
         det_hdr = np.fromstring(middle_pack[middle_hdr.itemsize:],
                                 dtype=detector_hdr, count=1)[0]
-        #print det_hdr["band"], det_hdr["detector"]
+        # print det_hdr["band"], det_hdr["detector"]
         if last_det + 1 != det_hdr["detector"]:
             for i in range(det_hdr["detector"] - (last_det + 1)):
-                scan.append(np.zeros(agg_zone0 * 2 + agg_zone1 * 2 + agg_zone2 * 2))
+                scan.append(np.zeros(agg_zone0 * 2 +
+                                     agg_zone1 * 2 + agg_zone2 * 2))
         last_det = det_hdr["detector"]
         try:
             d1, d2, d3, d4, d5, d6 = decode_line(middle_pack)
@@ -535,21 +557,24 @@ def build_scan(bunch, apid):
             continue
 
         if len(d1) != 4:
-            d1 = np.concatenate([np.array(chunk) for chunk in rice.decode(d1, 15, J, refblk)])
+            d1 = np.concatenate([np.array(chunk)
+                                 for chunk in rice.decode(d1, 15, J, refblk)])
             if len(d1) != agg_zone0:
                 d1 = np.zeros(agg_zone0, dtype=np.int64)
         else:
             d1 = np.zeros(agg_zone0, dtype=np.int64)
 
         if len(d6) != 4:
-            d6 = np.concatenate([np.array(chunk) for chunk in rice.decode(d6, 15, J, refblk)])
+            d6 = np.concatenate([np.array(chunk)
+                                 for chunk in rice.decode(d6, 15, J, refblk)])
             if len(d6) != agg_zone0:
                 d6 = np.zeros(agg_zone0, dtype=np.int64)
         else:
             d6 = np.zeros(agg_zone0, dtype=np.int64)
 
         if len(d2) != 4:
-            d2 = np.concatenate([np.array(chunk) for chunk in rice.decode(d2, 15, J, refblk)])
+            d2 = np.concatenate([np.array(chunk)
+                                 for chunk in rice.decode(d2, 15, J, refblk)])
             if len(d2) != agg_zone1:
                 print 'got', len(d2)
                 d2 = np.zeros(agg_zone1, dtype=np.int64)
@@ -557,16 +582,19 @@ def build_scan(bunch, apid):
             d2 = np.zeros(agg_zone1, dtype=np.int64)
 
         if len(d5) != 4:
-            d5 = np.concatenate([np.array(chunk) for chunk in rice.decode(d5, 15, J, refblk)])
+            d5 = np.concatenate([np.array(chunk)
+                                 for chunk in rice.decode(d5, 15, J, refblk)])
             if len(d5) != agg_zone1:
                 d5 = np.zeros(agg_zone1, dtype=np.int64)
         else:
             d5 = np.zeros(agg_zone1, dtype=np.int64)
 
-        d3 = np.concatenate([np.array(chunk) for chunk in rice.decode(d3, 15, J, refblk)])
+        d3 = np.concatenate([np.array(chunk)
+                             for chunk in rice.decode(d3, 15, J, refblk)])
         if len(d3) != agg_zone2:
             d3 = np.zeros(agg_zone2, dtype=np.int64)
-        d4 = np.concatenate([np.array(chunk) for chunk in rice.decode(d4, 15, J, refblk)])
+        d4 = np.concatenate([np.array(chunk)
+                             for chunk in rice.decode(d4, 15, J, refblk)])
         if len(d4) != agg_zone2:
             d4 = np.zeros(agg_zone2, dtype=np.int64)
         scan.append(np.hstack((d1, d2, d3, d4, d5, d6)))
@@ -600,7 +628,9 @@ dependencies = {'M05': 'M04',
                 'I05': 'M15',
                 'I02': 'I01',
                 'I03': 'I02',
+                'M07': 'I04'
                 }
+
 
 def get_deps(channel):
     res = [channel]
@@ -617,26 +647,25 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("cadu_file", help="cadu file to read")
     parser.add_argument("channel", nargs='+', help="channel to read")
-    parser.add_argument("-p", '--pn-decode', action='store_true', help="perform PN decoding")
+    parser.add_argument("-p", '--pn-decode',
+                        action='store_true', help="perform PN decoding")
     opts = parser.parse_args()
 
     packs = []
     test = []
     zone = []
-    J = 8
-    refblk = 128 * J
     #chs = read5(sys.argv[1])
     #channels = sort_ap(ccsds_packets(chs[16]))
     # for pack in data_packets(channels[812]):
 
     now = datetime.now()
 
-    #M12 812 ok.
-    #M10 808 ok.
-    #M9  807 ok.
-    #M6  805 nok. Wrapping ?
-    #M16 814 ok.
-    #M15 815 ok.
+    # M12 812 ok.
+    # M10 808 ok.
+    # M9  807 ok.
+    # M6  805 nok. Wrapping ?
+    # M16 814 ok.
+    # M15 815 ok.
 
     try:
         reqs = opts.channel
@@ -647,11 +676,14 @@ if __name__ == '__main__':
         apids_to_read = [channels[channel] for channel in to_read]
         apids_to_read.reverse()
         zone = Parallel(n_jobs=4)(delayed(build_scan)(pack, apid)
-                                  for apid, pack in read6(opts.cadu_file, vcid=16, apids=apids_to_read,
-                                                          pn=opts.pn_decode) if len(
-                pack) > 1)
-        #zone = [build_scan(pack, apid)
-        #        for apid, pack in read6(sys.argv[1], vcid=16, apids=to_read) if len(pack) > 1]
+                                  for apid, pack in read6(opts.cadu_file,
+                                                          vcid=16,
+                                                          apids=apids_to_read,
+                                                          pn=opts.pn_decode)
+                                  if len(pack) > 1)
+        # zone = [build_scan(pack, apid)
+        # for apid, pack in read6(sys.argv[1], vcid=16, apids=to_read) if
+        # len(pack) > 1]
 
         print "reading took", datetime.now() - now
 
@@ -669,19 +701,17 @@ if __name__ == '__main__':
             except KeyError:
                 pass
             # show(the_data)
-            img = Image([the_data[apid]], mode="L")
-            # img.stretch("linear")
+            img = Image([the_data[apid].astype(np.float32)], mode="L")
             img.stretch("histogram")
             img.show()
             import os
-            fname = os.path.splitext(os.path.basename(sys.argv[1]))[0] + apids[apid] + '.png'
+            fname = os.path.splitext(os.path.basename(sys.argv[1]))[
+                0] + apids[apid] + '.png'
             print 'saving', fname
             img.save(fname)
 
         #img =  Image([the_data[801], the_data[800], the_data[802]], mode="RGB")
-        #img.stretch("histogram")
-        #img.show()
+        # img.stretch("histogram")
+        # img.show()
     except Exception as err:
         raise
-
-
