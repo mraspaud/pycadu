@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+requires = [ "hatchling", "hatch-vcs" ]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
@@ -7,16 +7,14 @@ source = "vcs"
 
 [project]
 name = "pycadu"
-dynamic = ["version"]
+dynamic = [ "version" ]
 description = "Satellite-agnostic CCSDS/CADU/VCDU frame handling"
 readme = "README.rst"
-requires-python = ">=3.14"
+requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [ "LICENSE" ]
 
-authors = [
-  { name = "Martin Raspaud", email = "martin.raspaud@smhi.se" },
-]
+authors = [ { name = "Martin Raspaud", email = "martin.raspaud@smhi.se" } ]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
@@ -24,29 +22,23 @@ classifiers = [
   "Programming Language :: Python",
   "Topic :: Scientific/Engineering",
 ]
-dependencies = [
-  "numpy>=2.0",
-]
+dependencies = [ "numpy<2.0" ]
 
 [project.urls]
 Source = "https://github.com/mraspaud/pycadu"
 Issues = "https://github.com/mraspaud/pycadu/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pycadu"]
+packages = [ "src/pycadu" ]
 
 [tool.uv]
 cache-dir = ".uv-cache"
 
 [dependency-groups]
-dev = [
-  "pytest>=9.0",
-  "basedpyright>=1.0",
-  "ruff>=0.9",
-]
+dev = [ "pytest>=9.0", "basedpyright>=1.0", "ruff>=0.9" ]
 
 [tool.ruff]
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "RUF"]
+select = [ "E", "F", "I", "N", "UP", "RUF" ]
