@@ -3,11 +3,13 @@
 import numpy as np
 
 
-def find_sync_pattern(data: bytes, pattern: bytes, start: int = 0) -> tuple[int, int]:
+def find_sync_pattern(data: bytes, pattern: bytes, start: int = 0) -> tuple[int, int | None]:
     """Search for *pattern* in *data* at all 8 bit offsets.
 
-    Returns ``(byte_pos, bit_shift)`` of the earliest match, or ``(-1, 0)`` if not found.
-    *start* constrains the search to positions ``>= start``.
+    Returns ``(byte_pos, bit_shift)`` of the earliest match, or ``(-1, None)`` if not
+    found: the shift is None rather than 0 so that a caller unpacking straight into
+    its own "shift not yet known" state keeps that state instead of latching onto a
+    bogus byte-aligned 0.  *start* constrains the search to positions ``>= start``.
     """
     pos = data.find(pattern, start)
     if pos != -1:
@@ -22,7 +24,7 @@ def find_sync_pattern(data: bytes, pattern: bytes, start: int = 0) -> tuple[int,
                 best = (pos, shift)
             break
 
-    return best if best is not None else (-1, 0)
+    return best if best is not None else (-1, None)
 
 
 def _build_shifted(data: bytes, shift: int) -> bytes:

@@ -15,9 +15,10 @@ def test_returns_offset_when_pattern_found_mid_buffer():
     assert find_sync_pattern(data, PATTERN) == (50, 0)
 
 
-def test_returns_minus_one_when_pattern_absent():
+def test_returns_minus_one_and_no_shift_when_pattern_absent():
+    """The shift must be None, not 0: 0 is a valid shift and callers unpack it directly."""
     data = bytes(100)
-    assert find_sync_pattern(data, PATTERN) == (-1, 0)
+    assert find_sync_pattern(data, PATTERN) == (-1, None)
 
 
 def test_respects_start_offset():

@@ -137,6 +137,8 @@ def read_frames_batch(
                     prev_len = len(sync_acc)
                     sync_acc.extend(payloads)
                     search_start = max(0, prev_len - len(pattern))
+                    # on failure this restores bit_shift to None, so the next chunk
+                    # re-enters the search instead of latching to byte alignment
                     byte_pos, bit_shift = find_sync_pattern(
                         bytes(sync_acc), pattern, start=search_start
                     )
