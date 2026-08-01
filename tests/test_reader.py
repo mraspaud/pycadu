@@ -139,3 +139,57 @@ def test_read_frames_batch_finds_shifted_sync_after_syncless_first_chunk():
         frames = read_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
     assert len(frames) == 2
     assert all(f[: len(PATTERN)] == PATTERN for f in frames)
+
+
+def test_iter_frames_batch_matches_read_frames_batch():
+    """The streaming reader must yield exactly what the batch reader returns.
+
+    ``read_frames_batch`` is fast because it scans blocks with vectorised numpy,
+    but it accumulates the whole pass in a list. Consumers that process frames
+    as they arrive need that same scanning without the list, so the two must
+    agree frame for frame.
+    """
+    from pycadu.reader import iter_frames_batch, read_frames_batch
+
+    file_data = _wrap_frames_in_cadu_blocks(_two_frames(), vcid=3) * 3
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = Path(tmp) / "test.dat"
+        dat.write_bytes(file_data)
+        expected = read_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
+        actual = list(iter_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+    assert expected, "fixture produced no frames, so the comparison proves nothing"
+    assert actual == expected
+
+
+def test_iter_frames_batch_yields_before_the_file_is_exhausted():
+    """Frames are handed over as they are found, not gathered first."""
+    from pycadu.reader import iter_frames_batch
+
+    file_data = _wrap_frames_in_cadu_blocks(_two_frames(), vcid=3) * 3
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = Path(tmp) / "test.dat"
+        dat.write_bytes(file_data)
+        stream = iter_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
+        first = next(stream)
+        assert isinstance(first, bytes)
+        assert len(first) == FRAME_SIZE
+        list(stream)
+
+
+def test_iter_frames_batch_can_be_abandoned_early():
+    """Closing the generator before the file ends must not error.
+
+    The scan exposes the mmap through a numpy view; if that view outlives the
+    mapping, closing it raises BufferError. Streaming consumers stop early all
+    the time — a bounded read, or an exception downstream — so this is the
+    normal case, not an edge case.
+    """
+    from pycadu.reader import iter_frames_batch
+
+    file_data = _wrap_frames_in_cadu_blocks(_two_frames(), vcid=3) * 3
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = Path(tmp) / "test.dat"
+        dat.write_bytes(file_data)
+        stream = iter_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
+        next(stream)
+        stream.close()  # must not raise

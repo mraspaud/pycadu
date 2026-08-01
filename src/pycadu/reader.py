@@ -82,13 +82,13 @@ def iter_vcdu_frames(
     return vcdu_frames(vcdu_payloads(cadu_blocks(path, stride), stride, vcid), pattern, frame_size)
 
 
-def read_frames_batch(
+def iter_frames_batch(
     path: Path,
     stride: int,
     vcid: int,
     pattern: bytes,
     frame_size: int,
-) -> list[bytes]:
+) -> Iterator[bytes]:
     """Read all frames from a CADU file using vectorised numpy operations.
 
     Processes blocks in chunks to keep peak memory independent of file size
@@ -106,7 +106,6 @@ def read_frames_batch(
     bit_shift: int | None = None
     raw_carry: int = 0
     sync_acc: bytearray | None = bytearray()
-    frames: list[bytes] = []
     _ext = np.empty(_max_chunk_payload + 1, dtype=np.uint8)
     _sft = np.empty(_max_chunk_payload, dtype=np.uint8)
     _rhs = np.empty(_max_chunk_payload, dtype=np.uint8)
@@ -115,68 +114,87 @@ def read_frames_batch(
         with _mmap.mmap(_fh.fileno(), 0, access=_mmap.ACCESS_READ) as _mm:
             raw = np.frombuffer(_mm, dtype=np.uint8)
             n_blocks = len(raw) // stride
+            # ``raw`` is a view onto the mapping, so it must be released before the
+            # mmap closes — including when a consumer abandons the generator early,
+            # which is why this is a try/finally and not a trailing ``del``.
+            try:
 
-            for chunk_start in range(0, n_blocks, blocks_per_chunk):
-                chunk_end = min(chunk_start + blocks_per_chunk, n_blocks)
-                chunk = raw[chunk_start * stride : chunk_end * stride].reshape(
-                    chunk_end - chunk_start, stride
-                )
-                vcids = chunk[:, 5] & np.uint8(0x3F)
-                mersi_chunk = chunk[vcids == vcid]
-                del chunk, vcids
-                if len(mersi_chunk) == 0:
-                    del mersi_chunk
-                    continue
-                payloads = np.ascontiguousarray(
-                    mersi_chunk[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH]
-                ).ravel()
-                del mersi_chunk
-
-                if bit_shift is None:
-                    assert sync_acc is not None
-                    prev_len = len(sync_acc)
-                    sync_acc.extend(payloads)
-                    search_start = max(0, prev_len - len(pattern))
-                    # on failure this restores bit_shift to None, so the next chunk
-                    # re-enters the search instead of latching to byte alignment
-                    byte_pos, bit_shift = find_sync_pattern(
-                        bytes(sync_acc), pattern, start=search_start
+                for chunk_start in range(0, n_blocks, blocks_per_chunk):
+                    chunk_end = min(chunk_start + blocks_per_chunk, n_blocks)
+                    chunk = raw[chunk_start * stride : chunk_end * stride].reshape(
+                        chunk_end - chunk_start, stride
                     )
-                    if byte_pos == -1:
-                        raw_carry = int(sync_acc[-1])
-                        del payloads
+                    vcids = chunk[:, 5] & np.uint8(0x3F)
+                    mersi_chunk = chunk[vcids == vcid]
+                    del chunk, vcids
+                    if len(mersi_chunk) == 0:
+                        del mersi_chunk
                         continue
-                    shifted_init = (
-                        _build_shifted(bytes(sync_acc), bit_shift) if bit_shift else bytes(sync_acc)
-                    )
-                    buf.extend(shifted_init[byte_pos:])
-                    raw_carry = int(sync_acc[-1])
-                    sync_acc = None
-                else:
-                    if bit_shift:
-                        n = len(payloads)
-                        _ext[0] = raw_carry
-                        _ext[1 : n + 1] = payloads
-                        np.left_shift(_ext[:n], bit_shift, out=_sft[:n])
-                        np.right_shift(_ext[1 : n + 1], 8 - bit_shift, out=_rhs[:n])
-                        np.bitwise_or(_sft[:n], _rhs[:n], out=_sft[:n])
-                        buf.extend(_sft[:n])
+                    payloads = np.ascontiguousarray(
+                        mersi_chunk[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH]
+                    ).ravel()
+                    del mersi_chunk
+
+                    if bit_shift is None:
+                        assert sync_acc is not None
+                        prev_len = len(sync_acc)
+                        sync_acc.extend(payloads)
+                        search_start = max(0, prev_len - len(pattern))
+                        # on failure this restores bit_shift to None, so the next chunk
+                        # re-enters the search instead of latching to byte alignment
+                        byte_pos, bit_shift = find_sync_pattern(
+                            bytes(sync_acc), pattern, start=search_start
+                        )
+                        if byte_pos == -1:
+                            raw_carry = int(sync_acc[-1])
+                            del payloads
+                            continue
+                        shifted_init = (
+                            _build_shifted(bytes(sync_acc), bit_shift) if bit_shift else bytes(sync_acc)
+                        )
+                        buf.extend(shifted_init[byte_pos:])
+                        raw_carry = int(sync_acc[-1])
+                        sync_acc = None
                     else:
-                        buf.extend(payloads)
-                    raw_carry = int(payloads[-1])
-                del payloads
+                        if bit_shift:
+                            n = len(payloads)
+                            _ext[0] = raw_carry
+                            _ext[1 : n + 1] = payloads
+                            np.left_shift(_ext[:n], bit_shift, out=_sft[:n])
+                            np.right_shift(_ext[1 : n + 1], 8 - bit_shift, out=_rhs[:n])
+                            np.bitwise_or(_sft[:n], _rhs[:n], out=_sft[:n])
+                            buf.extend(_sft[:n])
+                        else:
+                            buf.extend(payloads)
+                        raw_carry = int(payloads[-1])
+                    del payloads
 
-                while len(buf) >= frame_size:
-                    if buf[:pat_len] == bytearray(pattern):
-                        frames.append(bytes(buf[:frame_size]))
-                        del buf[:frame_size]
-                    else:
-                        nxt = bytes(buf).find(pattern)
-                        if nxt == -1:
-                            del buf[: len(buf) - pat_len]
-                            break
-                        del buf[:nxt]
+                    while len(buf) >= frame_size:
+                        if buf[:pat_len] == bytearray(pattern):
+                            yield bytes(buf[:frame_size])
+                            del buf[:frame_size]
+                        else:
+                            nxt = bytes(buf).find(pattern)
+                            if nxt == -1:
+                                del buf[: len(buf) - pat_len]
+                                break
+                            del buf[:nxt]
 
-            del raw
+            finally:
+                del raw
 
-    return frames
+
+def read_frames_batch(
+    path: Path,
+    stride: int,
+    vcid: int,
+    pattern: bytes,
+    frame_size: int,
+) -> list[bytes]:
+    """Read all frames from a CADU file into a list.
+
+    Thin wrapper over :func:`iter_frames_batch`, which does the scanning; use
+    that directly to process frames as they are found instead of holding the
+    whole pass in memory.
+    """
+    return list(iter_frames_batch(path, stride, vcid, pattern, frame_size))
