@@ -15,6 +15,58 @@ from pycadu.sync import _build_shifted, find_sync_pattern
 BLOCKS_PER_CHUNK = 10_000
 
 
+class _SyncSeeker:
+    """Looks for the first sync pattern in a stream, keeping only what it must.
+
+    The pattern can straddle whatever the stream was cut into, and it can sit at
+    any of eight bit alignments, so the search cannot be done chunk by chunk in
+    isolation. What it *can* do is forget: once a chunk has been searched and
+    found wanting, the only bytes still of interest are the last few, where a
+    pattern beginning at the end of one chunk continues into the next.
+
+    Keeping the whole stream instead is the difference between a bounded reader
+    and one that holds an entire pass whenever the sync is late, the pattern is
+    wrong, or the data is corrupt — the cases where the stream is longest.
+    """
+
+    def __init__(self, pattern: bytes) -> None:
+        """Seek *pattern*, retaining only enough to catch a straddling one."""
+        self._pattern = pattern
+        #: A pattern shifted by up to seven bits spans one byte more than it is.
+        self._overlap = len(pattern) + 1
+        self._seen = bytearray()
+        #: The most recent byte fed in, which carries the unshift into the next
+        #: chunk. Kept apart from the accumulator so that finding the sync can
+        #: throw the accumulator away without losing it.
+        self.last_byte = 0
+
+    def feed(self, payload) -> tuple[bytes, int] | None:
+        """Search *payload*, with the tail of what came before it.
+
+        Returns ``(from_the_sync_on, bit_shift)`` once the pattern is found —
+        the stream from the first frame's first byte, shifted onto byte
+        alignment — or None, having kept only the overlap.
+
+        What came *before* the sync is junk by definition, and never leaves
+        here: everything held is dropped on the way out. A seeker that kept the
+        chunk it succeeded on, or handed it to a caller that did, would pin it
+        for the length of the pass — a fixed cost that no growth measurement
+        can see and every pass that syncs would pay.
+        """
+        self._seen.extend(payload)
+        if self._seen:
+            self.last_byte = self._seen[-1]
+        byte_pos, bit_shift = find_sync_pattern(bytes(self._seen), self._pattern)
+        if byte_pos == -1:
+            if len(self._seen) > self._overlap:
+                del self._seen[: len(self._seen) - self._overlap]
+            return None
+        held = bytes(self._seen)
+        self._seen = bytearray()
+        aligned = _build_shifted(held, bit_shift) if bit_shift else held
+        return aligned[byte_pos:], bit_shift
+
+
 def cadu_blocks(path: Path, stride: int) -> Iterator[bytes]:
     """Yield one raw physical block at a time without loading the whole file."""
     with open(path, "rb") as fh:
@@ -37,27 +89,21 @@ def vcdu_frames(payloads: Iterator[bytes], pattern: bytes, frame_size: int) -> I
     then unshifts each subsequent chunk using a one-byte carry to maintain
     bit alignment across chunk boundaries.
     """
-    raw_buf = bytearray()
+    seeker = _SyncSeeker(pattern)
     buf = bytearray()
     bit_shift: int | None = None
     carry: int = 0
 
     for chunk in payloads:
         if bit_shift is None:
-            raw_buf.extend(chunk)
-            byte_pos, shift = find_sync_pattern(bytes(raw_buf), pattern)
-            if byte_pos == -1:
-                keep = len(pattern) + 1
-                if len(raw_buf) > keep:
-                    del raw_buf[: len(raw_buf) - keep]
+            found = seeker.feed(chunk)
+            if found is None:
                 continue
-            if shift:
-                aligned = _build_shifted(bytes(raw_buf), shift)
-                buf = bytearray(aligned[byte_pos:])
-            else:
-                buf = bytearray(raw_buf[byte_pos:])
-            carry = raw_buf[-1]
-            bit_shift = shift
+            buf = bytearray(found[0])
+            bit_shift = found[1]
+            carry = seeker.last_byte
+            # Let go of the seek's copy: this frame outlives the whole pass.
+            found = None
         else:
             if bit_shift:
                 arr = np.frombuffer(bytes([carry]) + bytes(chunk), dtype=np.uint8)
@@ -177,37 +223,47 @@ def _prefetched(chunks: Iterator[np.ndarray], depth: int) -> Iterator[np.ndarray
 
     handover: _queue.Queue = _queue.Queue(maxsize=depth)
     stop = threading.Event()
-    failure: list[BaseException] = []
-    done = object()
+
+    def hand_over(item) -> bool:
+        """Put *item* on the queue, giving up only if the consumer has left.
+
+        Never on a timeout. The end of the stream travels this way too, and a
+        consumer busy for longer than any timeout we could pick would then wait
+        forever for an end that had been dropped — which is what a chunk of
+        calibration looks like.
+        """
+        while not stop.is_set():
+            try:
+                handover.put(item, timeout=0.05)
+            except _queue.Full:
+                continue
+            return True
+        return False
 
     def pull() -> None:
         """Fill the queue until the source ends, the consumer leaves, or it breaks."""
+        ending: tuple[str, BaseException | None] = ("done", None)
         try:
             for chunk in chunks:
-                while not stop.is_set():
-                    try:
-                        handover.put(chunk, timeout=0.05)
-                        break
-                    except _queue.Full:
-                        continue
-                else:
+                if not hand_over(("chunk", chunk)):
                     return
         except BaseException as broke:  # re-raised on the consumer's thread
-            failure.append(broke)
-        finally:
-            with contextlib.suppress(_queue.Full):
-                handover.put(done, timeout=1.0)
+            ending = ("failed", broke)
+        # The outcome rides on the queue rather than beside it, so a consumer
+        # that receives the end always receives what the end was.
+        hand_over(ending)
 
     reader = threading.Thread(target=pull, name="cadu-prefetch", daemon=True)
     reader.start()
     try:
         while True:
-            chunk = handover.get()
-            if chunk is done:
-                if failure:
-                    raise failure[0]
+            kind, payload = handover.get()
+            if kind == "chunk":
+                yield payload
+            elif kind == "failed":
+                raise payload
+            else:
                 return
-            yield chunk
     finally:
         stop.set()
         reader.join(timeout=5.0)
@@ -227,7 +283,7 @@ def _frames_from_block_chunks(
     buf = bytearray()
     bit_shift: int | None = None
     raw_carry: int = 0
-    sync_acc: bytearray | None = bytearray()
+    seeker = _SyncSeeker(pattern)
     scratch: dict[str, np.ndarray] = {}
 
     def _unshifted(payloads: np.ndarray, shift: int, carry: int) -> np.ndarray:
@@ -256,21 +312,15 @@ def _frames_from_block_chunks(
             continue
 
         if bit_shift is None:
-            assert sync_acc is not None
-            prev_len = len(sync_acc)
-            sync_acc.extend(payloads)
-            search_start = max(0, prev_len - pat_len)
-            # on failure this restores bit_shift to None, so the next chunk
-            # re-enters the search instead of latching to byte alignment
-            byte_pos, bit_shift = find_sync_pattern(bytes(sync_acc), pattern, start=search_start)
-            if byte_pos == -1:
-                raw_carry = int(sync_acc[-1])
+            found = seeker.feed(payloads)
+            raw_carry = seeker.last_byte
+            if found is None:
                 del payloads
                 continue
-            aligned = _build_shifted(bytes(sync_acc), bit_shift) if bit_shift else bytes(sync_acc)
-            buf.extend(aligned[byte_pos:])
-            raw_carry = int(sync_acc[-1])
-            sync_acc = None
+            buf.extend(found[0])
+            bit_shift = found[1]
+            # Let go of the seek's copy: this frame outlives the whole pass.
+            found = None
         elif bit_shift:
             buf.extend(_unshifted(payloads, bit_shift, raw_carry))
             raw_carry = int(payloads[-1])

@@ -106,7 +106,7 @@ class TailedFile:
         """Release the underlying file."""
         self._handle.close()
 
-    def __enter__(self) -> "TailedFile":
+    def __enter__(self) -> TailedFile:
         """Return the source itself, for use in a ``with`` block."""
         return self
 
@@ -187,7 +187,7 @@ class WriterClosed:
             self._observer.join(timeout=5.0)
             self._observer = None
 
-    def __enter__(self) -> "WriterClosed":
+    def __enter__(self) -> WriterClosed:
         """Return the watcher itself, for use in a ``with`` block."""
         return self
 

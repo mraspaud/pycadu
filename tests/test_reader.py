@@ -418,3 +418,162 @@ def test_reading_ahead_stays_bounded():
     assert ahead - alone <= chunk_bytes * (prefetch + 2), (
         f"read {(ahead - alone) / chunk_bytes:.1f} chunks ahead with a depth of {prefetch}"
     )
+
+
+class _FailingSource:
+    """A source that breaks part way through, as a socket or a disk can."""
+
+    def __init__(self, data: bytes, *, fails_after: int) -> None:
+        """Serve *data*, raising once *fails_after* reads have been answered."""
+        self._data = data
+        self._reads = 0
+        self._fails_after = fails_after
+        self.consumed = 0
+
+    def readinto(self, buffer) -> int:
+        """Fill *buffer*, or raise if this source has served its quota."""
+        if self._reads >= self._fails_after:
+            msg = "the source went away"
+            raise OSError(msg)
+        self._reads += 1
+        chunk = self._data[self.consumed : self.consumed + len(buffer)]
+        buffer[: len(chunk)] = chunk
+        self.consumed += len(chunk)
+        return len(chunk)
+
+
+def test_a_slow_consumer_still_reaches_the_end_of_the_stream():
+    """The end of the stream has to arrive however long the consumer takes.
+
+    The reader signals the end through the same bounded queue it hands chunks
+    over on. If that signal can be dropped when the queue is momentarily full,
+    a consumer that pauses — for as long as calibrating a chunk takes — drains
+    what is queued and then waits for an end that was thrown away.
+    """
+    import time
+
+    from pycadu.reader import iter_frames_from
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        stream = iter_frames_from(
+            _CountingSource(dat.read_bytes()), CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE,
+            blocks_per_chunk=64, prefetch=1,
+        )
+        frames = []
+        for frame in stream:
+            frames.append(frame)
+            if len(frames) == 1:
+                time.sleep(1.2)  # longer than any timeout the handover may use
+
+    assert len(frames) == 6, f"{len(frames)} frames came off a six-frame pass"
+
+
+def test_a_source_that_breaks_is_reported_however_full_the_queue_is():
+    """A failure must reach the consumer, not be swallowed with the sentinel.
+
+    Reading ahead moves the failure onto another thread. If it is only carried
+    alongside a signal that can be dropped, a broken source becomes a silent
+    short pass — which is the worst outcome available.
+    """
+    import time
+
+    import pytest
+
+    from pycadu.reader import iter_frames_from
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        stream = iter_frames_from(
+            _FailingSource(dat.read_bytes(), fails_after=200), CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE,
+            blocks_per_chunk=64, prefetch=1,
+        )
+        with pytest.raises(OSError, match="went away"):
+            for _frame in stream:
+                time.sleep(1.2)  # let the producer finish while the queue is full
+
+
+def test_a_stream_with_no_sync_in_it_does_not_accumulate():
+    """A stream that never syncs must cost the same however long it runs.
+
+    The wrong sync pattern, a corrupted pass, or a long lead-in before the first
+    frame all look the same to the reader: nothing to cut a frame on. If it
+    keeps every byte while it waits for a sync, the documented one-chunk bound
+    fails in exactly the case where the stream is longest. What is measured is
+    therefore the *growth*: scanning four times as much sync-free data must not
+    cost four times the memory.
+    """
+    import tracemalloc
+
+    from pycadu.reader import iter_frames_from
+
+    def peak_scanning(blocks: int) -> float:
+        """Peak tracked memory, in MB, while scanning *blocks* of sync-free CADU."""
+        junk = _wrap_frames_in_cadu_blocks(b"\x00" * (blocks * VCDU_PAYLOAD_LENGTH), vcid=3)
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            before = tracemalloc.get_traced_memory()[0]
+            frames = list(
+                iter_frames_from(_CountingSource(junk), CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
+            )
+            assert frames == [], "sync-free data yielded frames"
+            return (tracemalloc.get_traced_memory()[1] - before) / 1e6
+        finally:
+            tracemalloc.stop()
+
+    short = peak_scanning(10_000)
+    long = peak_scanning(40_000)
+
+    assert long < short * 1.5, (
+        f"scanning 4x the sync-free data cost {long:.0f} MB against {short:.0f} MB — it is accumulating"
+    )
+
+
+def test_finding_the_sync_does_not_pin_the_chunk_it_was_found_in():
+    """What the seek held is not wanted once it has found what it sought.
+
+    The search accumulates until it syncs, and everything before the sync is by
+    definition junk. Holding that chunk anyway pins it for the length of the
+    pass — a fixed cost rather than a growing one, so the sync-free growth test
+    cannot see it, and the bound this reader exists for is one chunk *worse*
+    than advertised on every pass that does sync. It is held twice over if the
+    caller keeps the copy the seek handed it, too.
+
+    What the reader may legitimately hold mid-pass is the chunk it is reading,
+    the part of the previous one it has not cut into frames yet, and the frame
+    it has just handed over. Anything beyond that is a copy nobody wants.
+    """
+    import gc
+    import tracemalloc
+
+    from pycadu.reader import BLOCKS_PER_CHUNK, iter_frames_from
+
+    # Two chunks of sync-free lead-in, then the frames: the sync is found in a
+    # chunk of its own, which is what would be retained.
+    junk = b"\x00" * (2 * BLOCKS_PER_CHUNK * VCDU_PAYLOAD_LENGTH)
+    data = _wrap_frames_in_cadu_blocks(junk + _two_frames(), vcid=3)
+
+    tracemalloc.start()
+    try:
+        gc.collect()
+        before = tracemalloc.get_traced_memory()[0]
+        stream = iter_frames_from(_CountingSource(data), CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
+        first = next(stream)
+        gc.collect()
+        # While the reader is suspended mid-pass: what it is *holding*, not its peak.
+        held = tracemalloc.get_traced_memory()[0] - before
+        stream.close()
+    finally:
+        tracemalloc.stop()
+
+    assert len(first) == FRAME_SIZE
+    budget = (
+        BLOCKS_PER_CHUNK * CADU_STRIDE_1024  # the chunk being read
+        + BLOCKS_PER_CHUNK * VCDU_PAYLOAD_LENGTH  # its payload, not yet cut into frames
+        + FRAME_SIZE  # the frame just handed over
+    )
+    assert held < budget, (
+        f"held {held / 1e6:.1f} MB against a budget of {budget / 1e6:.1f} MB — "
+        "about a chunk more than the reader has any use for"
+    )
