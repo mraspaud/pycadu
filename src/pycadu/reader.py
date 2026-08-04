@@ -1,5 +1,6 @@
 """Generic CADU/VCDU streaming and batch frame reassembly."""
 
+import contextlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,6 +9,10 @@ import numpy as np
 from pycadu.cadu import extract_cadu_data, extract_vcdu_payload, extract_vcid
 from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH
 from pycadu.sync import _build_shifted, find_sync_pattern
+
+#: Physical blocks scanned per vectorised pass. The chunk is what a reading
+#: source holds at once, so it also sets its memory cost.
+BLOCKS_PER_CHUNK = 10_000
 
 
 def cadu_blocks(path: Path, stride: int) -> Iterator[bytes]:
@@ -82,6 +87,210 @@ def iter_vcdu_frames(
     return vcdu_frames(vcdu_payloads(cadu_blocks(path, stride), stride, vcid), pattern, frame_size)
 
 
+def _mapped_block_chunks(path: Path, stride: int, blocks_per_chunk: int) -> Iterator[np.ndarray]:
+    """Yield the file's blocks a chunk at a time, as views onto one mapping.
+
+    Nothing is copied, which is the fastest way to scan a file that is already
+    there. The pages a scan touches would otherwise stay resident for as long as
+    the reader lives — the whole file, for a reader that runs beside the pipeline
+    consuming it — so each chunk is handed back to the kernel once the consumer
+    has moved past it. The scan only ever walks forward, which is what makes
+    that safe; a page asked for again is simply faulted back in.
+
+    Use :func:`_read_block_chunks` for a source that cannot be mapped at all.
+    """
+    import mmap as _mmap
+
+    with open(path, "rb") as fh, _mmap.mmap(fh.fileno(), 0, access=_mmap.ACCESS_READ) as mapping:
+        raw = np.frombuffer(mapping, dtype=np.uint8)
+        n_blocks = len(raw) // stride
+        # ``raw`` is a view onto the mapping, so it must be released before the
+        # mmap closes — including when a consumer abandons the generator early,
+        # which is why this is a try/finally and not a trailing ``del``.
+        try:
+            for start in range(0, n_blocks, blocks_per_chunk):
+                stop = min(start + blocks_per_chunk, n_blocks)
+                yield raw[start * stride : stop * stride].reshape(stop - start, stride)
+                _release_pages(mapping, start * stride, stop * stride)
+        finally:
+            del raw
+
+
+def _release_pages(mapping, first_byte: int, last_byte: int) -> None:
+    """Drop the resident pages wholly inside ``[first_byte, last_byte)``.
+
+    Whole pages only: a partial one at either end still holds bytes the scan has
+    not finished with. Advisory in every sense — where the platform does not
+    offer it, the mapping simply stays resident and only memory suffers.
+    """
+    import mmap as _mmap
+
+    page = _mmap.PAGESIZE
+    start = -(-first_byte // page) * page
+    length = ((last_byte - start) // page) * page
+    if length > 0:
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            mapping.madvise(_mmap.MADV_DONTNEED, start, length)
+
+
+def _read_block_chunks(source, stride: int, blocks_per_chunk: int) -> Iterator[np.ndarray]:
+    """Yield the source's blocks a chunk at a time, reading each one in.
+
+    What is held is one chunk, whatever the source's size, and the source is
+    only ever pulled from — so this reads a socket or a pipe as readily as a
+    file, and stops at whatever the source declares to be the end.
+
+    Each chunk gets its own buffer, so one may be handed on while the next is
+    being filled. That is what lets a prefetcher sit between this and the scan.
+    """
+    carried = np.zeros(0, dtype=np.uint8)
+    while True:
+        buffer = np.empty(blocks_per_chunk * stride, dtype=np.uint8)
+        view = memoryview(buffer.data).cast("B")
+        held = len(carried)
+        if held:
+            buffer[:held] = carried
+        filled = source.readinto(view[held:])
+        if not filled:
+            break
+        filled += held
+        # A read may stop mid-block; carry the remainder into the next chunk
+        # rather than losing it, since a source delivers what it has, not what
+        # it was asked for.
+        whole = filled // stride
+        carried = buffer[whole * stride : filled].copy()
+        if whole:
+            yield buffer[: whole * stride].reshape(whole, stride)
+
+
+def _prefetched(chunks: Iterator[np.ndarray], depth: int) -> Iterator[np.ndarray]:
+    """Yield what *chunks* yields, pulling it on a thread *depth* chunks ahead.
+
+    The reading and the scanning then overlap instead of taking turns, which is
+    worth having whenever the source has latency — a network filesystem, a
+    socket — and costs one buffer per queued chunk, so the depth is what bounds
+    it. The thread stops when the consumer does, including when it walks away
+    early.
+    """
+    import queue as _queue
+    import threading
+
+    handover: _queue.Queue = _queue.Queue(maxsize=depth)
+    stop = threading.Event()
+    failure: list[BaseException] = []
+    done = object()
+
+    def pull() -> None:
+        """Fill the queue until the source ends, the consumer leaves, or it breaks."""
+        try:
+            for chunk in chunks:
+                while not stop.is_set():
+                    try:
+                        handover.put(chunk, timeout=0.05)
+                        break
+                    except _queue.Full:
+                        continue
+                else:
+                    return
+        except BaseException as broke:  # re-raised on the consumer's thread
+            failure.append(broke)
+        finally:
+            with contextlib.suppress(_queue.Full):
+                handover.put(done, timeout=1.0)
+
+    reader = threading.Thread(target=pull, name="cadu-prefetch", daemon=True)
+    reader.start()
+    try:
+        while True:
+            chunk = handover.get()
+            if chunk is done:
+                if failure:
+                    raise failure[0]
+                return
+            yield chunk
+    finally:
+        stop.set()
+        reader.join(timeout=5.0)
+
+
+def _frames_from_block_chunks(
+    chunks: Iterator[np.ndarray], vcid: int, pattern: bytes, frame_size: int
+) -> Iterator[bytes]:
+    """Reassemble frames of *vcid* out of chunks of physical blocks.
+
+    The scanning itself: select the blocks of the wanted virtual channel, strip
+    their payloads, unshift them onto the sync pattern's bit alignment, and cut
+    frames out of the running buffer. Where the blocks came from — a mapping or
+    a stream — is the caller's choice and makes no difference to what comes out.
+    """
+    pat_len = len(pattern)
+    buf = bytearray()
+    bit_shift: int | None = None
+    raw_carry: int = 0
+    sync_acc: bytearray | None = bytearray()
+    scratch: dict[str, np.ndarray] = {}
+
+    def _unshifted(payloads: np.ndarray, shift: int, carry: int) -> np.ndarray:
+        """Shift a chunk's payloads into alignment, reusing the working arrays."""
+        n = len(payloads)
+        if scratch.get("ext") is None or len(scratch["ext"]) < n + 1:
+            scratch["ext"] = np.empty(n + 1, dtype=np.uint8)
+            scratch["sft"] = np.empty(n, dtype=np.uint8)
+            scratch["rhs"] = np.empty(n, dtype=np.uint8)
+        ext, sft, rhs = scratch["ext"], scratch["sft"], scratch["rhs"]
+        ext[0] = carry
+        ext[1 : n + 1] = payloads
+        np.left_shift(ext[:n], shift, out=sft[:n])
+        np.right_shift(ext[1 : n + 1], 8 - shift, out=rhs[:n])
+        np.bitwise_or(sft[:n], rhs[:n], out=sft[:n])
+        return sft[:n]
+
+    for chunk in chunks:
+        wanted = chunk[(chunk[:, 5] & np.uint8(0x3F)) == vcid]
+        payloads = wanted[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH].copy().ravel()
+        # Let go of the chunk before anything is yielded: it may be a window
+        # onto a mapping or a buffer the source is about to close or refill, and
+        # a copy of the payloads is all that is wanted from it anyway.
+        chunk = wanted = None
+        if len(payloads) == 0:
+            continue
+
+        if bit_shift is None:
+            assert sync_acc is not None
+            prev_len = len(sync_acc)
+            sync_acc.extend(payloads)
+            search_start = max(0, prev_len - pat_len)
+            # on failure this restores bit_shift to None, so the next chunk
+            # re-enters the search instead of latching to byte alignment
+            byte_pos, bit_shift = find_sync_pattern(bytes(sync_acc), pattern, start=search_start)
+            if byte_pos == -1:
+                raw_carry = int(sync_acc[-1])
+                del payloads
+                continue
+            aligned = _build_shifted(bytes(sync_acc), bit_shift) if bit_shift else bytes(sync_acc)
+            buf.extend(aligned[byte_pos:])
+            raw_carry = int(sync_acc[-1])
+            sync_acc = None
+        elif bit_shift:
+            buf.extend(_unshifted(payloads, bit_shift, raw_carry))
+            raw_carry = int(payloads[-1])
+        else:
+            buf.extend(payloads)
+            raw_carry = int(payloads[-1])
+        del payloads
+
+        while len(buf) >= frame_size:
+            if buf[:pat_len] == bytearray(pattern):
+                yield bytes(buf[:frame_size])
+                del buf[:frame_size]
+            else:
+                nxt = bytes(buf).find(pattern)
+                if nxt == -1:
+                    del buf[: len(buf) - pat_len]
+                    break
+                del buf[:nxt]
+
+
 def iter_frames_batch(
     path: Path,
     stride: int,
@@ -89,99 +298,69 @@ def iter_frames_batch(
     pattern: bytes,
     frame_size: int,
 ) -> Iterator[bytes]:
-    """Read all frames from a CADU file using vectorised numpy operations.
+    """Yield all frames of *vcid* from a CADU file, scanning a mapping of it.
 
-    Processes blocks in chunks to keep peak memory independent of file size
-    (~200 MB peak regardless of file size).  ~20x faster than the streaming
-    generator on a typical pass file.
+    ~20x faster than the per-block streaming generator, because the blocks are
+    selected and stripped with vectorised numpy. Nothing is copied out of the
+    file, so the pages the scan touches stay resident as long as the generator
+    lives; :func:`iter_frames_read` is the same scan over a source that is read
+    instead, for a reader that runs alongside its consumer.
     """
-    import mmap as _mmap
+    return _frames_from_block_chunks(
+        _mapped_block_chunks(path, stride, BLOCKS_PER_CHUNK), vcid, pattern, frame_size
+    )
 
-    pat_len = len(pattern)
-    payload_len = CADU_DATA_LENGTH - CCSDS_HEADER_LENGTH
-    blocks_per_chunk = 10_000
-    _max_chunk_payload = blocks_per_chunk * payload_len
 
-    buf = bytearray()
-    bit_shift: int | None = None
-    raw_carry: int = 0
-    sync_acc: bytearray | None = bytearray()
-    _ext = np.empty(_max_chunk_payload + 1, dtype=np.uint8)
-    _sft = np.empty(_max_chunk_payload, dtype=np.uint8)
-    _rhs = np.empty(_max_chunk_payload, dtype=np.uint8)
+def iter_frames_from(
+    source,
+    stride: int,
+    vcid: int,
+    pattern: bytes,
+    frame_size: int,
+    *,
+    blocks_per_chunk: int = BLOCKS_PER_CHUNK,
+    prefetch: int = 0,
+) -> Iterator[bytes]:
+    """Yield all frames of *vcid* read from an open binary *source*.
 
-    with open(path, "rb") as _fh:
-        with _mmap.mmap(_fh.fileno(), 0, access=_mmap.ACCESS_READ) as _mm:
-            raw = np.frombuffer(_mm, dtype=np.uint8)
-            n_blocks = len(raw) // stride
-            # ``raw`` is a view onto the mapping, so it must be released before the
-            # mmap closes — including when a consumer abandons the generator early,
-            # which is why this is a try/finally and not a trailing ``del``.
-            try:
+    The same scan :func:`iter_frames_batch` does, over anything that can be read
+    from — a file, a pipe, a socket, or a
+    :class:`~pycadu.tail.TailedFile` following a pass as it is received. It
+    pulls: a chunk of blocks is read in, scanned and handed on, so what it holds
+    is one chunk however long the source turns out to be, and it ends when the
+    source does.
 
-                for chunk_start in range(0, n_blocks, blocks_per_chunk):
-                    chunk_end = min(chunk_start + blocks_per_chunk, n_blocks)
-                    chunk = raw[chunk_start * stride : chunk_end * stride].reshape(
-                        chunk_end - chunk_start, stride
-                    )
-                    vcids = chunk[:, 5] & np.uint8(0x3F)
-                    mersi_chunk = chunk[vcids == vcid]
-                    del chunk, vcids
-                    if len(mersi_chunk) == 0:
-                        del mersi_chunk
-                        continue
-                    payloads = np.ascontiguousarray(
-                        mersi_chunk[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH]
-                    ).ravel()
-                    del mersi_chunk
+    *prefetch* puts the reading on its own thread, that many chunks ahead of the
+    scan, so a source with latency is being read while the previous chunk is
+    still being scanned. Zero — the default — keeps everything on the calling
+    thread, which is what a local file wants.
+    """
+    chunks = _read_block_chunks(source, stride, blocks_per_chunk)
+    if prefetch:
+        chunks = _prefetched(chunks, prefetch)
+    return _frames_from_block_chunks(chunks, vcid, pattern, frame_size)
 
-                    if bit_shift is None:
-                        assert sync_acc is not None
-                        prev_len = len(sync_acc)
-                        sync_acc.extend(payloads)
-                        search_start = max(0, prev_len - len(pattern))
-                        # on failure this restores bit_shift to None, so the next chunk
-                        # re-enters the search instead of latching to byte alignment
-                        byte_pos, bit_shift = find_sync_pattern(
-                            bytes(sync_acc), pattern, start=search_start
-                        )
-                        if byte_pos == -1:
-                            raw_carry = int(sync_acc[-1])
-                            del payloads
-                            continue
-                        shifted_init = (
-                            _build_shifted(bytes(sync_acc), bit_shift) if bit_shift else bytes(sync_acc)
-                        )
-                        buf.extend(shifted_init[byte_pos:])
-                        raw_carry = int(sync_acc[-1])
-                        sync_acc = None
-                    else:
-                        if bit_shift:
-                            n = len(payloads)
-                            _ext[0] = raw_carry
-                            _ext[1 : n + 1] = payloads
-                            np.left_shift(_ext[:n], bit_shift, out=_sft[:n])
-                            np.right_shift(_ext[1 : n + 1], 8 - bit_shift, out=_rhs[:n])
-                            np.bitwise_or(_sft[:n], _rhs[:n], out=_sft[:n])
-                            buf.extend(_sft[:n])
-                        else:
-                            buf.extend(payloads)
-                        raw_carry = int(payloads[-1])
-                    del payloads
 
-                    while len(buf) >= frame_size:
-                        if buf[:pat_len] == bytearray(pattern):
-                            yield bytes(buf[:frame_size])
-                            del buf[:frame_size]
-                        else:
-                            nxt = bytes(buf).find(pattern)
-                            if nxt == -1:
-                                del buf[: len(buf) - pat_len]
-                                break
-                            del buf[:nxt]
+def iter_frames_read(
+    path: Path,
+    stride: int,
+    vcid: int,
+    pattern: bytes,
+    frame_size: int,
+    *,
+    blocks_per_chunk: int = BLOCKS_PER_CHUNK,
+) -> Iterator[bytes]:
+    """Yield all frames of *vcid* from a CADU file, reading it a chunk at a time.
 
-            finally:
-                del raw
+    Frame for frame what :func:`iter_frames_batch` yields. The difference is
+    residency: this holds one chunk of blocks rather than however much of the
+    file the scan has touched, which is what a reader running beside the
+    pipeline consuming it needs.
+    """
+    with open(path, "rb") as source:
+        yield from iter_frames_from(
+            source, stride, vcid, pattern, frame_size, blocks_per_chunk=blocks_per_chunk
+        )
 
 
 def read_frames_batch(

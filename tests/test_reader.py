@@ -193,3 +193,228 @@ def test_iter_frames_batch_can_be_abandoned_early():
         stream = iter_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
         next(stream)
         stream.close()  # must not raise
+
+
+def _fixture_file(tmp: str) -> Path:
+    """A small CADU file holding six frames across several blocks."""
+    dat = Path(tmp) / "test.dat"
+    dat.write_bytes(_wrap_frames_in_cadu_blocks(_two_frames(), vcid=3) * 3)
+    return dat
+
+
+def test_reading_the_file_yields_the_frames_mapping_it_does():
+    """The reader that reads must find exactly what the reader that maps finds.
+
+    Mapping the whole file makes every page it touches resident for as long as
+    the reader lives, which is fine for a reader that runs to completion up
+    front and expensive for one that runs beside the pipeline consuming it. The
+    two must be interchangeable, or the choice is not one a caller can make.
+    """
+    from pycadu.reader import iter_frames_batch, iter_frames_read
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        mapped = list(iter_frames_batch(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+        read = list(iter_frames_read(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+    assert mapped, "fixture produced no frames, so the comparison proves nothing"
+    assert read == mapped
+
+
+def test_reading_finds_a_shifted_sync_after_a_syncless_first_chunk():
+    """The sync search spans chunk boundaries here exactly as it does mapped."""
+    import numpy as np
+
+    from pycadu.reader import iter_frames_read
+
+    shift = 4
+    raw = _two_frames() + bytes(2)
+    arr = np.frombuffer(raw, dtype=np.uint8).astype(np.uint16)
+    right_shifted = np.empty(len(arr), dtype=np.uint8)
+    right_shifted[0] = arr[0] >> shift
+    right_shifted[1:] = (((arr[:-1] << (8 - shift)) | (arr[1:] >> shift)) & 0xFF).astype(np.uint8)
+    junk = b"\x00" * (11_000 * VCDU_PAYLOAD_LENGTH)
+    file_data = _wrap_frames_in_cadu_blocks(junk + bytes(right_shifted[:-1]), vcid=3)
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = Path(tmp) / "test.dat"
+        dat.write_bytes(file_data)
+        frames = list(iter_frames_read(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+    assert len(frames) == 2
+    assert all(f[: len(PATTERN)] == PATTERN for f in frames)
+
+
+def test_reading_takes_in_no_more_than_a_chunk_at_a_time():
+    """A frame is handed over having read a bounded prefix, not the whole file.
+
+    This is the property the reader exists for: what it holds is one chunk of
+    blocks, whatever the file's size — so a consumer running beside it does not
+    have the whole pass resident behind its back.
+    """
+    from pycadu.reader import iter_frames_from
+
+    blocks_per_chunk = 64
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        with dat.open("rb") as source:
+            stream = iter_frames_from(
+                source, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE, blocks_per_chunk=blocks_per_chunk
+            )
+            next(stream)
+            consumed = source.tell()
+            frames = list(stream)
+        size = dat.stat().st_size
+    assert consumed < size, f"read {consumed} of {size} bytes before the first frame"
+    assert frames, "only one frame came out of a six-frame file"
+
+
+def test_reading_takes_any_binary_stream_not_only_a_path():
+    """A live feed is a stream, not a file, and the reader must not care.
+
+    Handed an open source it pulls from, this is the same reader an operational
+    receiver can point at a socket or a pipe.
+    """
+    import io
+
+    from pycadu.reader import iter_frames_from, iter_frames_read
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        expected = list(iter_frames_read(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+        source = io.BytesIO(dat.read_bytes())
+        actual = list(iter_frames_from(source, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+    assert expected
+    assert actual == expected
+
+
+def test_a_frame_split_across_chunk_boundaries_is_completed_not_dropped():
+    """Frames straddle the reader's chunks, and every seam must be invisible.
+
+    A frame is ~4300 blocks long, so with any realistic chunk size most frames
+    begin in one chunk and end in another — dropping the ones on the seams would
+    quietly lose most of the pass. Here the chunk is smaller than a frame, so
+    *every* frame spans several of them.
+    """
+    from pycadu.reader import iter_frames_from, iter_frames_read
+
+    blocks_per_frame = -(-FRAME_SIZE // VCDU_PAYLOAD_LENGTH)
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        whole = list(iter_frames_read(dat, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE))
+        with dat.open("rb") as source:
+            in_pieces = list(
+                iter_frames_from(
+                    source, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE,
+                    blocks_per_chunk=blocks_per_frame // 3,
+                )
+            )
+    assert len(whole) == 6, f"fixture gave {len(whole)} frames"
+    assert in_pieces == whole, f"{len(in_pieces)} frames survived being cut into thirds, not {len(whole)}"
+
+
+class _CountingSource:
+    """A binary source that records how much of itself has been read."""
+
+    def __init__(self, data: bytes) -> None:
+        """Serve *data*, counting the bytes handed out."""
+        self._data = data
+        self.consumed = 0
+
+    def readinto(self, buffer) -> int:
+        """Fill *buffer* from what is left, as a file object would."""
+        chunk = self._data[self.consumed : self.consumed + len(buffer)]
+        buffer[: len(chunk)] = chunk
+        self.consumed += len(chunk)
+        return len(chunk)
+
+
+def test_reading_ahead_keeps_pulling_while_the_consumer_works():
+    """A slow source and a busy consumer should wait for each other less.
+
+    One thread doing both the reading and the scanning alternates between
+    blocking on the source and using the CPU — fine on a local disk, wasteful on
+    anything with latency. Reading ahead overlaps the two.
+    """
+    import time
+
+    from pycadu.reader import iter_frames_from
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        data = dat.read_bytes()
+
+        def consumed_after_first_frame(prefetch: int) -> int:
+            source = _CountingSource(data)
+            stream = iter_frames_from(
+                source, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE,
+                blocks_per_chunk=64, prefetch=prefetch,
+            )
+            next(stream)
+            time.sleep(0.3)  # the consumer is busy with the frame it was given
+            ahead = source.consumed
+            stream.close()
+            return ahead
+
+        alone = consumed_after_first_frame(0)
+        reading_ahead = consumed_after_first_frame(4)
+
+    assert reading_ahead > alone, (
+        f"reading ahead got through {reading_ahead} bytes against {alone} without"
+    )
+    assert reading_ahead <= len(data), "the source was drained past what was asked for"
+
+
+def test_reading_ahead_yields_the_same_frames():
+    """Overlapping the read with the scan may not change what comes out."""
+    from pycadu.reader import iter_frames_from
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dat = _fixture_file(tmp)
+        data = dat.read_bytes()
+        plain = list(
+            iter_frames_from(_CountingSource(data), CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE)
+        )
+        ahead = list(
+            iter_frames_from(
+                _CountingSource(data), CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE, prefetch=4
+            )
+        )
+    assert plain
+    assert ahead == plain
+
+
+def test_reading_ahead_stays_bounded():
+    """The read-ahead is the depth asked for, not the rest of the pass.
+
+    An unbounded prefetch is just a slower way of loading the whole file, which
+    is the thing this reader exists not to do. What it may run ahead by is
+    measured against the same scan without it: a frame is far longer than a
+    chunk here, so the scan itself consumes many chunks before the first frame
+    appears, and that is not read-ahead.
+    """
+    import time
+
+    from pycadu.reader import iter_frames_from
+
+    blocks_per_chunk, prefetch = 64, 2
+
+    def consumed_after_first_frame(depth: int, data: bytes) -> int:
+        source = _CountingSource(data)
+        stream = iter_frames_from(
+            source, CADU_STRIDE_1024, 3, PATTERN, FRAME_SIZE,
+            blocks_per_chunk=blocks_per_chunk, prefetch=depth,
+        )
+        next(stream)
+        time.sleep(0.3)
+        consumed = source.consumed
+        stream.close()
+        return consumed
+
+    with tempfile.TemporaryDirectory() as tmp:
+        data = _fixture_file(tmp).read_bytes() * 4
+        alone = consumed_after_first_frame(0, data)
+        ahead = consumed_after_first_frame(prefetch, data)
+
+    chunk_bytes = blocks_per_chunk * CADU_STRIDE_1024
+    # `prefetch` queued, one held by the reader, one part-filled
+    assert ahead - alone <= chunk_bytes * (prefetch + 2), (
+        f"read {(ahead - alone) / chunk_bytes:.1f} chunks ahead with a depth of {prefetch}"
+    )

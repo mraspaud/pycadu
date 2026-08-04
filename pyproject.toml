@@ -28,6 +28,14 @@ dependencies = [
   "numpy>=2.0",
 ]
 
+[project.optional-dependencies]
+# Reading a pass while it is still being received needs to know when the writer
+# has finished with the file. Without this the only signal left is the file
+# going quiet, which costs an idle timeout at the end of every pass.
+watch = [
+  "watchdog>=4.0",
+]
+
 [project.urls]
 Source = "https://github.com/mraspaud/pycadu"
 Issues = "https://github.com/mraspaud/pycadu/issues"
