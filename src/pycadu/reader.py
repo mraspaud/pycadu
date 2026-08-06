@@ -118,7 +118,10 @@ def vcdu_frames(payloads: Iterator[bytes], pattern: bytes, frame_size: int) -> I
             if bytes(buf[: len(pattern)]) != pattern:
                 nxt = bytes(buf).find(pattern)
                 if nxt == -1:
-                    buf.clear()
+                    # Keep what a pattern could already be starting in. Dropping
+                    # the whole buffer instead costs the first frame after the
+                    # corruption as well as the corruption itself.
+                    del buf[: len(buf) - len(pattern)]
                     break
                 del buf[:nxt]
                 continue
