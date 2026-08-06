@@ -67,6 +67,115 @@ class _SyncSeeker:
         return aligned[byte_pos:], bit_shift
 
 
+class _ShiftBuffers:
+    """Reusable working arrays for unshifting a chunk onto byte alignment.
+
+    A pass is millions of bytes in chunks of a few hundred thousand; allocating
+    three arrays per chunk is allocation the reader does not need to do.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing allocated; the first chunk sizes the buffers."""
+        self._extended: np.ndarray | None = None
+        self._shifted: np.ndarray | None = None
+        self._remainder: np.ndarray | None = None
+
+    def unshift(self, payloads: np.ndarray, shift: int, carry: int) -> np.ndarray:
+        """Return *payloads* shifted left by *shift* bits, continuing from *carry*."""
+        n = len(payloads)
+        if self._extended is None or len(self._extended) < n + 1:
+            self._extended = np.empty(n + 1, dtype=np.uint8)
+            self._shifted = np.empty(n, dtype=np.uint8)
+            self._remainder = np.empty(n, dtype=np.uint8)
+        extended, shifted, remainder = self._extended, self._shifted, self._remainder
+        extended[0] = carry
+        extended[1 : n + 1] = payloads
+        np.left_shift(extended[:n], shift, out=shifted[:n])
+        np.right_shift(extended[1 : n + 1], 8 - shift, out=remainder[:n])
+        np.bitwise_or(shifted[:n], remainder[:n], out=shifted[:n])
+        return shifted[:n]
+
+
+class _FrameCutter:
+    """Cut fixed-length frames out of a stream of payload bytes.
+
+    The awkward parts of reassembly live here so that both readers share them:
+    the sync pattern arrives at any of eight bit alignments and may straddle
+    whatever the stream was cut into, so alignment is discovered once and then
+    carried across chunks a byte at a time.
+
+    Where the payloads came from — a byte stream, a mapping, a socket — makes no
+    difference, which is the point: the two readers differ only in how they get
+    bytes, and used to differ in how they cut them too.
+    """
+
+    def __init__(self, pattern: bytes, frame_size: int) -> None:
+        """Cut frames of *frame_size* bytes, each opening with *pattern*."""
+        self._pattern = pattern
+        self._frame_size = frame_size
+        self._seeker = _SyncSeeker(pattern)
+        self._buffer = bytearray()
+        self._bit_shift: int | None = None
+        self._carry = 0
+        self._buffers = _ShiftBuffers()
+
+    def feed(self, payloads) -> Iterator[bytes]:
+        """Take one chunk of payload bytes and return the frames it completes.
+
+        Absorbing is a plain call rather than part of the generator so that the
+        chunk is released before any frame is yielded. A generator suspended
+        mid-pass keeps its locals alive, which would pin a whole chunk for as
+        long as the consumer takes over the frame it was handed.
+        """
+        self._absorb(payloads)
+        return self._cut()
+
+    def _absorb(self, payloads) -> None:
+        """Add one chunk to the buffer, finding the sync alignment if needed."""
+        if len(payloads) == 0:
+            return
+        if self._bit_shift is None:
+            found = self._seeker.feed(payloads)
+            self._carry = self._seeker.last_byte
+            if found is None:
+                return
+            self._buffer.extend(found[0])
+            self._bit_shift = found[1]
+            # Let go of the seek's copy: this frame outlives the whole pass.
+            found = None
+        elif self._bit_shift:
+            self._buffer.extend(self._buffers.unshift(_as_array(payloads), self._bit_shift, self._carry))
+            self._carry = int(payloads[-1])
+        else:
+            self._buffer.extend(payloads)
+            self._carry = int(payloads[-1])
+
+    def _cut(self) -> Iterator[bytes]:
+        """Yield every whole frame the buffer now holds, resynchronising if needed."""
+        pattern, frame_size = self._pattern, self._frame_size
+        buffer = self._buffer
+        while len(buffer) >= frame_size:
+            if buffer[: len(pattern)] == pattern:
+                yield bytes(buffer[:frame_size])
+                del buffer[:frame_size]
+                continue
+            next_sync = bytes(buffer).find(pattern)
+            if next_sync == -1:
+                # Keep what a pattern could already be starting in. Dropping the
+                # whole buffer instead costs the first frame after a run of
+                # corruption as well as the corruption itself.
+                del buffer[: len(buffer) - len(pattern)]
+                return
+            del buffer[:next_sync]
+
+
+def _as_array(payloads) -> np.ndarray:
+    """View *payloads* as bytes, whether they arrived as bytes or as an array."""
+    if isinstance(payloads, np.ndarray):
+        return payloads
+    return np.frombuffer(bytes(payloads), dtype=np.uint8)
+
+
 def cadu_blocks(path: Path, stride: int) -> Iterator[bytes]:
     """Yield one raw physical block at a time without loading the whole file."""
     with open(path, "rb") as fh:
@@ -83,50 +192,10 @@ def vcdu_payloads(blocks: Iterator[bytes], stride: int, target_vcid: int) -> Ite
 
 
 def vcdu_frames(payloads: Iterator[bytes], pattern: bytes, frame_size: int) -> Iterator[bytes]:
-    """Reassemble VCDU payload chunks into complete fixed-length frames.
-
-    Detects the bit-shift of the sync pattern (0-7 bits) on first sync find,
-    then unshifts each subsequent chunk using a one-byte carry to maintain
-    bit alignment across chunk boundaries.
-    """
-    seeker = _SyncSeeker(pattern)
-    buf = bytearray()
-    bit_shift: int | None = None
-    carry: int = 0
-
+    """Reassemble VCDU payload chunks into complete fixed-length frames."""
+    cutter = _FrameCutter(pattern, frame_size)
     for chunk in payloads:
-        if bit_shift is None:
-            found = seeker.feed(chunk)
-            if found is None:
-                continue
-            buf = bytearray(found[0])
-            bit_shift = found[1]
-            carry = seeker.last_byte
-            # Let go of the seek's copy: this frame outlives the whole pass.
-            found = None
-        else:
-            if bit_shift:
-                arr = np.frombuffer(bytes([carry]) + bytes(chunk), dtype=np.uint8)
-                lo = arr[:-1].astype(np.uint16) << bit_shift
-                hi = arr[1:].astype(np.uint16) >> (8 - bit_shift)
-                buf.extend(((lo | hi) & 0xFF).astype(np.uint8))
-                carry = chunk[-1] if chunk else carry
-            else:
-                buf.extend(chunk)
-
-        while len(buf) >= frame_size:
-            if bytes(buf[: len(pattern)]) != pattern:
-                nxt = bytes(buf).find(pattern)
-                if nxt == -1:
-                    # Keep what a pattern could already be starting in. Dropping
-                    # the whole buffer instead costs the first frame after the
-                    # corruption as well as the corruption itself.
-                    del buf[: len(buf) - len(pattern)]
-                    break
-                del buf[:nxt]
-                continue
-            yield bytes(buf[:frame_size])
-            del buf[:frame_size]
+        yield from cutter.feed(chunk)
 
 
 def iter_vcdu_frames(
@@ -277,71 +346,24 @@ def _frames_from_block_chunks(
 ) -> Iterator[bytes]:
     """Reassemble frames of *vcid* out of chunks of physical blocks.
 
-    The scanning itself: select the blocks of the wanted virtual channel, strip
-    their payloads, unshift them onto the sync pattern's bit alignment, and cut
-    frames out of the running buffer. Where the blocks came from — a mapping or
-    a stream — is the caller's choice and makes no difference to what comes out.
+    Selects the blocks of the wanted virtual channel and strips their payloads;
+    the reassembly itself is :class:`_FrameCutter`'s. Where the blocks came from
+    — a mapping or a stream — is the caller's choice and makes no difference to
+    what comes out.
     """
-    pat_len = len(pattern)
-    buf = bytearray()
-    bit_shift: int | None = None
-    raw_carry: int = 0
-    seeker = _SyncSeeker(pattern)
-    scratch: dict[str, np.ndarray] = {}
-
-    def _unshifted(payloads: np.ndarray, shift: int, carry: int) -> np.ndarray:
-        """Shift a chunk's payloads into alignment, reusing the working arrays."""
-        n = len(payloads)
-        if scratch.get("ext") is None or len(scratch["ext"]) < n + 1:
-            scratch["ext"] = np.empty(n + 1, dtype=np.uint8)
-            scratch["sft"] = np.empty(n, dtype=np.uint8)
-            scratch["rhs"] = np.empty(n, dtype=np.uint8)
-        ext, sft, rhs = scratch["ext"], scratch["sft"], scratch["rhs"]
-        ext[0] = carry
-        ext[1 : n + 1] = payloads
-        np.left_shift(ext[:n], shift, out=sft[:n])
-        np.right_shift(ext[1 : n + 1], 8 - shift, out=rhs[:n])
-        np.bitwise_or(sft[:n], rhs[:n], out=sft[:n])
-        return sft[:n]
-
+    cutter = _FrameCutter(pattern, frame_size)
     for chunk in chunks:
         wanted = chunk[(chunk[:, 5] & np.uint8(0x3F)) == vcid]
         payloads = wanted[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH].copy().ravel()
-        # Let go of the chunk before anything is yielded: it may be a window
-        # onto a mapping or a buffer the source is about to close or refill, and
-        # a copy of the payloads is all that is wanted from it anyway.
+        # Let go of the chunk before anything is yielded: it may be a window onto
+        # a mapping or a buffer the source is about to close or refill, and a
+        # copy of the payloads is all that is wanted from it anyway.
         chunk = wanted = None
-        if len(payloads) == 0:
-            continue
-
-        if bit_shift is None:
-            found = seeker.feed(payloads)
-            raw_carry = seeker.last_byte
-            if found is None:
-                del payloads
-                continue
-            buf.extend(found[0])
-            bit_shift = found[1]
-            # Let go of the seek's copy: this frame outlives the whole pass.
-            found = None
-        elif bit_shift:
-            buf.extend(_unshifted(payloads, bit_shift, raw_carry))
-            raw_carry = int(payloads[-1])
-        else:
-            buf.extend(payloads)
-            raw_carry = int(payloads[-1])
-        del payloads
-
-        while len(buf) >= frame_size:
-            if buf[:pat_len] == bytearray(pattern):
-                yield bytes(buf[:frame_size])
-                del buf[:frame_size]
-            else:
-                nxt = bytes(buf).find(pattern)
-                if nxt == -1:
-                    del buf[: len(buf) - pat_len]
-                    break
-                del buf[:nxt]
+        frames = cutter.feed(payloads)
+        # Release the chunk before yielding: a generator suspended while the
+        # consumer works on a frame would otherwise pin it for that whole time.
+        payloads = None
+        yield from frames
 
 
 def iter_frames_batch(
