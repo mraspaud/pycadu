@@ -14,6 +14,7 @@ from the scheduler — and failing that too, going quiet for long enough is what
 is left, and it is the default.
 """
 
+import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,9 @@ DEFAULT_IDLE_TIMEOUT = 60.0
 #: How often a quiet source is asked again. Frames are seconds apart, so this
 #: costs nothing and bounds how late the end of a pass is noticed.
 DEFAULT_POLL_INTERVAL = 0.5
+
+
+_log = logging.getLogger(__name__)
 
 
 class TailedFile:
@@ -115,6 +119,33 @@ class TailedFile:
         self.close()
 
 
+class _WriterClosedHandler:
+    """Watches a directory for the one event that means a writer is finished.
+
+    Subclasses watchdog's handler lazily, at construction, so that this module
+    imports without watchdog installed — the tailing reader falls back to an
+    idle timeout in that case.
+    """
+
+    def __new__(cls, path: Path, mark_closed) -> object:
+        """Build a watchdog handler bound to *path*."""
+        from watchdog.events import EVENT_TYPE_CLOSED, FileSystemEventHandler
+
+        watched = str(path.resolve())
+
+        class _Closed(FileSystemEventHandler):
+            def on_any_event(self, event) -> None:
+                """Record a close-after-write of the file being followed."""
+                # Only a *write* close: the tailing reader holds the same file
+                # open, and a reader letting go says nothing about the pass.
+                if event.event_type != EVENT_TYPE_CLOSED or event.is_directory:
+                    return
+                if str(Path(_as_text(event.src_path)).resolve()) == watched:
+                    mark_closed()
+
+        return _Closed()
+
+
 class WriterClosed:
     """Reports when the process writing *path* has closed it.
 
@@ -143,27 +174,18 @@ class WriterClosed:
     def _start(self) -> None:
         """Begin watching, or record that nothing is watching."""
         try:
-            from watchdog.events import EVENT_TYPE_CLOSED, FileSystemEventHandler
             from watchdog.observers import Observer
         except ImportError:
+            _log.info(
+                "watchdog is not installed, so the end of %s will be inferred from a quiet "
+                "period rather than from its writer closing it; install pycadu[watch] for "
+                "the exact signal",
+                self._path.name,
+            )
             return
 
-        watched = str(self._path.resolve())
-        mark_closed = self._mark_closed
-
-        class _Closed(FileSystemEventHandler):
-            """Notices the one event that means the writer is finished."""
-
-            def on_any_event(self, event) -> None:
-                """Record a close-after-write of the file being followed."""
-                # Only a *write* close: the tailing reader holds the same file
-                # open, and a reader letting go says nothing about the pass.
-                if event.event_type == EVENT_TYPE_CLOSED and not event.is_directory:
-                    if str(Path(_as_text(event.src_path)).resolve()) == watched:
-                        mark_closed()
-
         observer = Observer()
-        observer.schedule(_Closed(), str(self._path.parent), recursive=False)
+        observer.schedule(_WriterClosedHandler(self._path, self._mark_closed), str(self._path.parent))
         observer.start()
         self._observer = observer
 
