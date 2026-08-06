@@ -146,3 +146,41 @@ def test_a_pattern_begun_at_the_end_of_a_discarded_buffer_survives():
 
     found = list(vcdu_frames(iter([first, second]), PATTERN, FRAME_SIZE))
     assert len(found) == 3, f"the split pattern cost {3 - len(found)} of 3 frames"
+
+
+def test_one_entry_point_serves_a_path_a_stream_and_a_mapping(tmp_path):
+    """However the pass is opened, the same spec yields the same frames."""
+    from pycadu.constants import CADU_STRIDE_1024
+    from pycadu.reader import FrameSpec, iter_frames
+
+    stream = _frames(3)
+    blocks = _as_blocks(stream)
+    path = tmp_path / "pass.dat"
+    path.write_bytes(blocks.tobytes())
+
+    spec = FrameSpec(stride=CADU_STRIDE_1024, vcid=VCID, pattern=PATTERN, frame_size=FRAME_SIZE)
+
+    read = list(iter_frames(path, spec))
+    mapped = list(iter_frames(path, spec, mapped=True))
+    with path.open("rb") as handle:
+        streamed = list(iter_frames(handle, spec))
+    with path.open("rb") as handle:
+        ahead = list(iter_frames(handle, spec, prefetch=2))
+
+    assert len(read) == 3, f"reading the path found {len(read)} frames of 3"
+    assert mapped == read
+    assert streamed == read
+    assert ahead == read
+
+
+def test_mapping_an_already_open_stream_is_refused(tmp_path):
+    """Asking for a mapping of something that cannot be mapped must say so."""
+    from pycadu.constants import CADU_STRIDE_1024
+    from pycadu.reader import FrameSpec, iter_frames
+
+    path = tmp_path / "pass.dat"
+    path.write_bytes(_as_blocks(_frames(1)).tobytes())
+    spec = FrameSpec(CADU_STRIDE_1024, VCID, PATTERN, FRAME_SIZE)
+
+    with path.open("rb") as handle, pytest.raises(TypeError, match="path"):
+        list(iter_frames(handle, spec, mapped=True))

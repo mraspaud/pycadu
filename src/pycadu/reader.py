@@ -2,7 +2,9 @@
 
 import contextlib
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 
@@ -366,28 +368,84 @@ def _frames_from_block_chunks(
         yield from frames
 
 
-def iter_frames_batch(
-    path: Path,
-    stride: int,
-    vcid: int,
-    pattern: bytes,
-    frame_size: int,
+@dataclass(frozen=True)
+class FrameSpec:
+    """How to find one instrument's frames in a CADU stream.
+
+    These four travel together through every reader and every caller, and mean
+    nothing apart: a stride without a pattern does not describe anything. Naming
+    them together also stops the two integers being handed over in the wrong
+    order, which nothing else would catch.
+    """
+
+    stride: int
+    """Bytes per physical CADU block, including headers and parity."""
+    vcid: int
+    """Virtual channel carrying the wanted instrument."""
+    pattern: bytes
+    """Sync pattern each frame opens with."""
+    frame_size: int
+    """Bytes per reassembled frame."""
+
+
+def iter_frames(
+    source: Path | str | BinaryIO,
+    spec: FrameSpec,
+    *,
+    mapped: bool = False,
+    prefetch: int = 0,
+    blocks_per_chunk: int = BLOCKS_PER_CHUNK,
 ) -> Iterator[bytes]:
+    """Yield the frames *spec* describes, from a file path or an open stream.
+
+    Reads a chunk of blocks at a time by default, which is what a reader running
+    beside the pipeline that consumes it needs: it holds one chunk rather than
+    however much of the file a scan has touched.
+
+    *mapped* scans a mapping of the file instead. Frame for frame the same, and
+    worth it for a one-shot pass over a file nothing else is waiting on, but the
+    pages the scan touches stay resident for as long as the generator lives.
+
+    *prefetch* runs the reading ahead of the consumer on its own thread, up to
+    that many chunks. Worth it when the source is slower than the pipeline —
+    a pass still arriving over a network mount — and pointless otherwise.
+    """
+    if mapped:
+        if not isinstance(source, (str, Path)):
+            msg = "mapped=True needs a path, not an already-open stream"
+            raise TypeError(msg)
+        chunks = _mapped_block_chunks(Path(source), spec.stride, blocks_per_chunk)
+        yield from _frames_from_block_chunks(chunks, spec.vcid, spec.pattern, spec.frame_size)
+        return
+
+    if isinstance(source, (str, Path)):
+        with open(source, "rb") as opened:
+            yield from _iter_frames_from_stream(opened, spec, prefetch, blocks_per_chunk)
+        return
+    yield from _iter_frames_from_stream(source, spec, prefetch, blocks_per_chunk)
+
+
+def _iter_frames_from_stream(
+    source: BinaryIO, spec: FrameSpec, prefetch: int, blocks_per_chunk: int
+) -> Iterator[bytes]:
+    """Cut *spec*'s frames out of an open stream, optionally reading ahead."""
+    chunks = _read_block_chunks(source, spec.stride, blocks_per_chunk)
+    if prefetch > 0:
+        chunks = _prefetched(chunks, prefetch)
+    yield from _frames_from_block_chunks(chunks, spec.vcid, spec.pattern, spec.frame_size)
+
+
+def iter_frames_batch(path: Path, stride: int, vcid: int, pattern: bytes, frame_size: int) -> Iterator[bytes]:
     """Yield all frames of *vcid* from a CADU file, scanning a mapping of it.
 
-    ~20x faster than the per-block streaming generator, because the blocks are
-    selected and stripped with vectorised numpy. Nothing is copied out of the
-    file, so the pages the scan touches stay resident as long as the generator
-    lives; :func:`iter_frames_read` is the same scan over a source that is read
-    instead, for a reader that runs alongside its consumer.
+    Kept for callers written against the older shape; :func:`iter_frames` with
+    ``mapped=True`` is the same thing.
     """
-    return _frames_from_block_chunks(
-        _mapped_block_chunks(path, stride, BLOCKS_PER_CHUNK), vcid, pattern, frame_size
-    )
+    return iter_frames(path, FrameSpec(stride, vcid, pattern, frame_size), mapped=True)
 
 
 def iter_frames_from(
-    source,
+    source: BinaryIO,
     stride: int,
     vcid: int,
     pattern: bytes,
@@ -396,24 +454,13 @@ def iter_frames_from(
     blocks_per_chunk: int = BLOCKS_PER_CHUNK,
     prefetch: int = 0,
 ) -> Iterator[bytes]:
-    """Yield all frames of *vcid* read from an open binary *source*.
-
-    The same scan :func:`iter_frames_batch` does, over anything that can be read
-    from — a file, a pipe, a socket, or a
-    :class:`~pycadu.tail.TailedFile` following a pass as it is received. It
-    pulls: a chunk of blocks is read in, scanned and handed on, so what it holds
-    is one chunk however long the source turns out to be, and it ends when the
-    source does.
-
-    *prefetch* puts the reading on its own thread, that many chunks ahead of the
-    scan, so a source with latency is being read while the previous chunk is
-    still being scanned. Zero — the default — keeps everything on the calling
-    thread, which is what a local file wants.
-    """
-    chunks = _read_block_chunks(source, stride, blocks_per_chunk)
-    if prefetch:
-        chunks = _prefetched(chunks, prefetch)
-    return _frames_from_block_chunks(chunks, vcid, pattern, frame_size)
+    """Yield all frames of *vcid* from an open stream. See :func:`iter_frames`."""
+    return iter_frames(
+        source,
+        FrameSpec(stride, vcid, pattern, frame_size),
+        prefetch=prefetch,
+        blocks_per_chunk=blocks_per_chunk,
+    )
 
 
 def iter_frames_read(
@@ -425,30 +472,12 @@ def iter_frames_read(
     *,
     blocks_per_chunk: int = BLOCKS_PER_CHUNK,
 ) -> Iterator[bytes]:
-    """Yield all frames of *vcid* from a CADU file, reading it a chunk at a time.
-
-    Frame for frame what :func:`iter_frames_batch` yields. The difference is
-    residency: this holds one chunk of blocks rather than however much of the
-    file the scan has touched, which is what a reader running beside the
-    pipeline consuming it needs.
-    """
-    with open(path, "rb") as source:
-        yield from iter_frames_from(
-            source, stride, vcid, pattern, frame_size, blocks_per_chunk=blocks_per_chunk
-        )
+    """Yield all frames of *vcid* from a CADU file, reading it. See :func:`iter_frames`."""
+    return iter_frames(
+        path, FrameSpec(stride, vcid, pattern, frame_size), blocks_per_chunk=blocks_per_chunk
+    )
 
 
-def read_frames_batch(
-    path: Path,
-    stride: int,
-    vcid: int,
-    pattern: bytes,
-    frame_size: int,
-) -> list[bytes]:
-    """Read all frames from a CADU file into a list.
-
-    Thin wrapper over :func:`iter_frames_batch`, which does the scanning; use
-    that directly to process frames as they are found instead of holding the
-    whole pass in memory.
-    """
-    return list(iter_frames_batch(path, stride, vcid, pattern, frame_size))
+def read_frames_batch(path: Path, stride: int, vcid: int, pattern: bytes, frame_size: int) -> list[bytes]:
+    """Read all frames from a CADU file into a list. See :func:`iter_frames`."""
+    return list(iter_frames(path, FrameSpec(stride, vcid, pattern, frame_size), mapped=True))
