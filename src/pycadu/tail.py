@@ -14,6 +14,8 @@ from the scheduler — and failing that too, going quiet for long enough is what
 is left, and it is the default.
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from collections.abc import Callable
