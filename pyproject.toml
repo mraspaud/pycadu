@@ -50,14 +50,20 @@ packages = ["src/pycadu"]
 cache-dir = ".uv-cache"
 
 [dependency-groups]
-dev = [
+tests = [
   "pytest>=9.0",
+  "pytest-cov",
+]
+dev = [
+  { include-group = "tests" },
   "basedpyright>=1.0",
   "ruff>=0.9",
 ]
 
 [tool.ruff]
 line-length = 120
+# The scripts in bin/legacy predate the package and are kept as they were.
+extend-exclude = ["bin/legacy"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "RUF"]

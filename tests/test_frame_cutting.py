@@ -184,3 +184,31 @@ def test_mapping_an_already_open_stream_is_refused(tmp_path):
 
     with path.open("rb") as handle, pytest.raises(TypeError, match="path"):
         list(iter_frames(handle, spec, mapped=True))
+
+
+def test_a_frame_ends_at_the_next_sync_marker():
+    """A frame that lost blocks downstream is handed out short, not padded with its successor.
+
+    Cutting a fixed length regardless puts the head of the next frame inside the
+    short one, and the rest of the next frame, which no longer starts with a sync
+    marker, is skipped: one lost block costs the following frame as well.
+    """
+    short = _frames(1)[: FRAME_SIZE * 3 // 4]
+    whole = bytearray(_frames(1))
+    whole[len(PATTERN) :] = bytes([0x5A]) * (FRAME_SIZE - len(PATTERN))
+    stream = short + bytes(whole)
+
+    found = _cut_from_bytes(stream, chunk=97)
+
+    assert found == [short, bytes(whole)]
+
+
+def test_a_short_frame_from_payloads_alone_does_not_claim_a_count(caplog):
+    """Payloads stripped of their headers carry no counter, so how much was lost is not known."""
+    stream = _frames(1)[: FRAME_SIZE // 2] + _frames(1)
+
+    with caplog.at_level("WARNING", logger="pycadu"):
+        _cut_from_bytes(stream, chunk=97)
+
+    assert [(r.frame_index, r.lost_blocks) for r in caplog.records] == [(0, None)]
+    assert "unknown" in caplog.records[0].getMessage()

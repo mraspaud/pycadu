@@ -1,0 +1,36 @@
+name: Deploy to PyPI
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pycadu
+    permissions:
+      # Trusted publishing: PyPI accepts a short-lived token from GitHub, so
+      # no API token is stored in the repository's secrets.
+      id-token: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          # hatch-vcs takes the version from the release's tag.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2

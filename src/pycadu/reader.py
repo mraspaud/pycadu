@@ -1,7 +1,9 @@
 """Generic CADU/VCDU streaming and batch frame reassembly."""
 
 import contextlib
-from collections.abc import Iterator
+import logging
+from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -9,12 +11,14 @@ from typing import BinaryIO
 import numpy as np
 
 from pycadu.cadu import extract_cadu_data, extract_vcdu_payload, extract_vcid
-from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH
+from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH, VCDU_COUNTER_MODULUS, VCDU_PAYLOAD_LENGTH
 from pycadu.sync import _build_shifted, find_sync_pattern
 
 #: Physical blocks scanned per vectorised pass. The chunk is what a reading
 #: source holds at once, so it also sets its memory cost.
 BLOCKS_PER_CHUNK = 10_000
+
+_log = logging.getLogger(__name__)
 
 
 class _SyncSeeker:
@@ -99,7 +103,7 @@ class _ShiftBuffers:
 
 
 class _FrameCutter:
-    """Cut fixed-length frames out of a stream of payload bytes.
+    """Cut frames out of a stream of payload bytes, each from one sync marker to the next.
 
     The awkward parts of reassembly live here so that both readers share them:
     the sync pattern arrives at any of eight bit alignments and may straddle
@@ -111,25 +115,40 @@ class _FrameCutter:
     bytes, and used to differ in how they cut them too.
     """
 
-    def __init__(self, pattern: bytes, frame_size: int) -> None:
-        """Cut frames of *frame_size* bytes, each opening with *pattern*."""
+    def __init__(self, pattern: bytes, frame_size: int, *, counts_lost_blocks: bool = False) -> None:
+        """Cut frames opening with *pattern*, of *frame_size* bytes unless the next one starts sooner.
+
+        *counts_lost_blocks* says the caller reads the VCDU counter and passes on
+        what it skips; without it, a short frame is reported with no count.
+        """
         self._pattern = pattern
+        self._counts_lost_blocks = counts_lost_blocks
         self._frame_size = frame_size
         self._seeker = _SyncSeeker(pattern)
         self._buffer = bytearray()
         self._bit_shift: int | None = None
         self._carry = 0
         self._buffers = _ShiftBuffers()
+        #: Payload bytes fed so far, which places a frame in the stream.
+        self._fed = 0
+        #: ``(stream position, blocks)`` of losses not yet charged to a frame.
+        self._losses: deque[tuple[int, int]] = deque()
+        self._frame_index = 0
 
-    def feed(self, payloads) -> Iterator[bytes]:
+    def feed(self, payloads, losses: Iterable[tuple[int, int]] = ()) -> Iterator[bytes]:
         """Take one chunk of payload bytes and return the frames it completes.
+
+        *losses* are ``(offset, blocks)`` pairs: *blocks* went missing just
+        before byte *offset* of this chunk.
 
         Absorbing is a plain call rather than part of the generator so that the
         chunk is released before any frame is yielded. A generator suspended
         mid-pass keeps its locals alive, which would pin a whole chunk for as
         long as the consumer takes over the frame it was handed.
         """
+        self._losses.extend((self._fed + offset, count) for offset, count in losses)
         self._absorb(payloads)
+        self._fed += len(payloads)
         return self._cut()
 
     def _absorb(self, payloads) -> None:
@@ -152,14 +171,57 @@ class _FrameCutter:
             self._buffer.extend(payloads)
             self._carry = int(payloads[-1])
 
+    def _stream_position_of_buffer(self) -> int:
+        """Where the buffer's first byte sits among the payload bytes fed so far.
+
+        Unshifting holds the last byte fed back as the carry into the next chunk,
+        so a shifted buffer ends one byte short of the stream.
+        """
+        held_back = 1 if self._bit_shift else 0
+        return self._fed - held_back - len(self._buffer)
+
+    def _account_for(self, frame_length: int) -> None:
+        """Number the frame opening the buffer, and warn if it is short or lost blocks.
+
+        Each loss is charged to the first frame that ends at or after it, so none
+        goes unreported however the frames fall around it.
+        """
+        start = self._stream_position_of_buffer()
+        lost = 0
+        while self._losses and self._losses[0][0] <= start + frame_length:
+            lost += self._losses.popleft()[1]
+        if lost or frame_length < self._frame_size:
+            lost_blocks = lost if self._counts_lost_blocks else None
+            _log.warning(
+                "frame %d at payload byte %d is %d bytes of %d: %s VCDU block(s) lost",
+                self._frame_index,
+                start,
+                frame_length,
+                self._frame_size,
+                "an unknown number of" if lost_blocks is None else lost_blocks,
+                extra={"frame_index": self._frame_index, "lost_blocks": lost_blocks},
+            )
+        self._frame_index += 1
+
     def _cut(self) -> Iterator[bytes]:
-        """Yield every whole frame the buffer now holds, resynchronising if needed."""
+        """Yield every frame the buffer now holds, resynchronising if needed.
+
+        A frame ends *frame_size* bytes after its sync marker, or at the next
+        marker if that comes first: a frame that lost blocks on the way down is
+        short, and cutting it at full length would swallow the head of the frame
+        after it and leave the rest of that one without a marker to be found by.
+        The marker is the only evidence used, so one that occurs by chance in a
+        frame's payload splits that frame, as one at a frame start already would.
+        """
         pattern, frame_size = self._pattern, self._frame_size
         buffer = self._buffer
         while len(buffer) >= frame_size:
             if buffer[: len(pattern)] == pattern:
-                yield bytes(buffer[:frame_size])
-                del buffer[:frame_size]
+                next_sync = buffer.find(pattern, len(pattern), frame_size)
+                frame_end = frame_size if next_sync == -1 else next_sync
+                self._account_for(frame_end)
+                yield bytes(buffer[:frame_end])
+                del buffer[:frame_end]
                 continue
             next_sync = bytes(buffer).find(pattern)
             if next_sync == -1:
@@ -194,7 +256,7 @@ def vcdu_payloads(blocks: Iterator[bytes], stride: int, target_vcid: int) -> Ite
 
 
 def vcdu_frames(payloads: Iterator[bytes], pattern: bytes, frame_size: int) -> Iterator[bytes]:
-    """Reassemble VCDU payload chunks into complete fixed-length frames."""
+    """Reassemble VCDU payload chunks into frames, each ending where the next begins."""
     cutter = _FrameCutter(pattern, frame_size)
     for chunk in payloads:
         yield from cutter.feed(chunk)
@@ -343,6 +405,28 @@ def _prefetched(chunks: Iterator[np.ndarray], depth: int) -> Iterator[np.ndarray
         reader.join(timeout=5.0)
 
 
+def _vcdu_counters(blocks: np.ndarray) -> np.ndarray:
+    """The 24-bit VCDU counter of each block, after its sync marker and VCDU id."""
+    counter = blocks[:, 6:9].astype(np.int64)
+    return (counter[:, 0] << 16) | (counter[:, 1] << 8) | counter[:, 2]
+
+
+def _losses_between(previous_counter: int | None, counters: np.ndarray) -> list[tuple[int, int]]:
+    """``(payload offset, blocks lost)`` wherever *counters* skip, continuing from *previous_counter*.
+
+    With no previous counter, the stream starts here and its first block has
+    nothing before it to have lost. A counter that repeats is a block sent
+    twice, or a stream that does not number its blocks, and has lost nothing.
+    """
+    if len(counters) == 0:
+        return []
+    if previous_counter is None:
+        previous_counter = int(counters[0]) - 1
+    steps = np.diff(counters, prepend=previous_counter) % VCDU_COUNTER_MODULUS
+    lost = np.where(steps == 0, 0, steps - 1)
+    return [(int(block) * VCDU_PAYLOAD_LENGTH, int(lost[block])) for block in np.flatnonzero(lost)]
+
+
 def _frames_from_block_chunks(
     chunks: Iterator[np.ndarray], vcid: int, pattern: bytes, frame_size: int
 ) -> Iterator[bytes]:
@@ -353,15 +437,20 @@ def _frames_from_block_chunks(
     — a mapping or a stream — is the caller's choice and makes no difference to
     what comes out.
     """
-    cutter = _FrameCutter(pattern, frame_size)
+    cutter = _FrameCutter(pattern, frame_size, counts_lost_blocks=True)
+    previous_counter: int | None = None
     for chunk in chunks:
         wanted = chunk[(chunk[:, 5] & np.uint8(0x3F)) == vcid]
         payloads = wanted[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH].copy().ravel()
+        counters = _vcdu_counters(wanted)
+        losses = _losses_between(previous_counter, counters)
+        if len(counters):
+            previous_counter = int(counters[-1])
         # Let go of the chunk before anything is yielded: it may be a window onto
         # a mapping or a buffer the source is about to close or refill, and a
         # copy of the payloads is all that is wanted from it anyway.
-        chunk = wanted = None
-        frames = cutter.feed(payloads)
+        chunk = wanted = counters = None
+        frames = cutter.feed(payloads, losses)
         # Release the chunk before yielding: a generator suspended while the
         # consumer works on a frame would otherwise pin it for that whole time.
         payloads = None
@@ -385,7 +474,7 @@ class FrameSpec:
     pattern: bytes
     """Sync pattern each frame opens with."""
     frame_size: int
-    """Bytes per reassembled frame."""
+    """Bytes per whole frame. A frame that lost blocks on the way down is shorter."""
 
 
 def iter_frames(
