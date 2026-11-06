@@ -11,7 +11,7 @@ from typing import BinaryIO
 import numpy as np
 
 from pycadu.cadu import extract_cadu_data, extract_vcdu_payload, extract_vcid
-from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH, VCDU_PAYLOAD_LENGTH
+from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH, VCDU_COUNTER_MODULUS, VCDU_PAYLOAD_LENGTH
 from pycadu.sync import _build_shifted, find_sync_pattern
 
 #: Physical blocks scanned per vectorised pass. The chunk is what a reading
@@ -416,7 +416,7 @@ def _losses_between(previous_counter: int | None, counters: np.ndarray) -> list[
         return []
     if previous_counter is None:
         previous_counter = int(counters[0]) - 1
-    steps = np.diff(counters, prepend=previous_counter)
+    steps = np.diff(counters, prepend=previous_counter) % VCDU_COUNTER_MODULUS
     lost = np.where(steps == 0, 0, steps - 1)
     return [(int(block) * VCDU_PAYLOAD_LENGTH, int(lost[block])) for block in np.flatnonzero(lost)]
 
