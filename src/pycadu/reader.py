@@ -409,13 +409,15 @@ def _losses_between(previous_counter: int | None, counters: np.ndarray) -> list[
     """``(payload offset, blocks lost)`` wherever *counters* skip, continuing from *previous_counter*.
 
     With no previous counter, the stream starts here and its first block has
-    nothing before it to have lost.
+    nothing before it to have lost. A counter that repeats is a block sent
+    twice, or a stream that does not number its blocks, and has lost nothing.
     """
     if len(counters) == 0:
         return []
     if previous_counter is None:
         previous_counter = int(counters[0]) - 1
-    lost = np.diff(counters, prepend=previous_counter) - 1
+    steps = np.diff(counters, prepend=previous_counter)
+    lost = np.where(steps == 0, 0, steps - 1)
     return [(int(block) * VCDU_PAYLOAD_LENGTH, int(lost[block])) for block in np.flatnonzero(lost)]
 
 
