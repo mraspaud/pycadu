@@ -3,7 +3,7 @@
 import contextlib
 import logging
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -135,7 +135,7 @@ class _FrameCutter:
         self._losses: deque[tuple[int, int]] = deque()
         self._frame_index = 0
 
-    def feed(self, payloads, losses=()) -> Iterator[bytes]:
+    def feed(self, payloads, losses: Iterable[tuple[int, int]] = ()) -> Iterator[bytes]:
         """Take one chunk of payload bytes and return the frames it completes.
 
         *losses* are ``(offset, blocks)`` pairs: *blocks* went missing just
