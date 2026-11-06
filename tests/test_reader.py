@@ -627,3 +627,12 @@ def test_the_first_block_of_a_stream_has_lost_nothing(caplog):
 
     assert len(frames) == 3
     assert warnings == [], [w.getMessage() for w in warnings]
+
+
+@pytest.mark.xfail(strict=True, reason="a counter wrapping to 0 reads as a step back")
+def test_a_counter_wrapping_round_has_lost_nothing(caplog):
+    """The counter is 24 bits wide, so after 0xFFFFFF comes 0, not a loss."""
+    frames, warnings = _frames_and_warnings(_blocks_numbered(list(range(2**24 - 4, 2**24 + 5))), caplog)
+
+    assert len(frames) == 3
+    assert warnings == [], [w.getMessage() for w in warnings]
