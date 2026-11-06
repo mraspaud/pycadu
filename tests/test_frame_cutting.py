@@ -184,3 +184,21 @@ def test_mapping_an_already_open_stream_is_refused(tmp_path):
 
     with path.open("rb") as handle, pytest.raises(TypeError, match="path"):
         list(iter_frames(handle, spec, mapped=True))
+
+
+@pytest.mark.xfail(strict=True, reason="a frame is cut at frame_size even when the next sync marker comes sooner")
+def test_a_frame_ends_at_the_next_sync_marker():
+    """A frame that lost blocks downstream is handed out short, not padded with its successor.
+
+    Cutting a fixed length regardless puts the head of the next frame inside the
+    short one, and the rest of the next frame, which no longer starts with a sync
+    marker, is skipped: one lost block costs the following frame as well.
+    """
+    short = _frames(1)[: FRAME_SIZE * 3 // 4]
+    whole = bytearray(_frames(1))
+    whole[len(PATTERN) :] = bytes([0x5A]) * (FRAME_SIZE - len(PATTERN))
+    stream = short + bytes(whole)
+
+    found = _cut_from_bytes(stream, chunk=97)
+
+    assert found == [short, bytes(whole)]
