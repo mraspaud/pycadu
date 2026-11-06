@@ -636,3 +636,14 @@ def test_a_counter_wrapping_round_has_lost_nothing(caplog):
 
     assert len(frames) == 3
     assert warnings == [], [w.getMessage() for w in warnings]
+
+
+@pytest.mark.xfail(strict=True, reason="a repeated counter reads as a step of -1")
+def test_a_repeated_block_has_lost_nothing(caplog):
+    """A block sent twice under one counter is a duplicate, not a loss of the whole counter range."""
+    counters = [0, 1, 2, 3, 4, 5, 5, 6, 7, 8]  # block 5 arrives twice
+
+    frames, warnings = _frames_and_warnings(_blocks_numbered(counters), caplog)
+
+    assert len(frames) == 3
+    assert warnings == [], [w.getMessage() for w in warnings]
