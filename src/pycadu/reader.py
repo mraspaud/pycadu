@@ -158,8 +158,10 @@ class _FrameCutter:
         buffer = self._buffer
         while len(buffer) >= frame_size:
             if buffer[: len(pattern)] == pattern:
-                yield bytes(buffer[:frame_size])
-                del buffer[:frame_size]
+                next_sync = buffer.find(pattern, len(pattern), frame_size)
+                frame_end = frame_size if next_sync == -1 else next_sync
+                yield bytes(buffer[:frame_end])
+                del buffer[:frame_end]
                 continue
             next_sync = bytes(buffer).find(pattern)
             if next_sync == -1:

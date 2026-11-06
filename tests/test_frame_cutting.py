@@ -186,7 +186,6 @@ def test_mapping_an_already_open_stream_is_refused(tmp_path):
         list(iter_frames(handle, spec, mapped=True))
 
 
-@pytest.mark.xfail(strict=True, reason="a frame is cut at frame_size even when the next sync marker comes sooner")
 def test_a_frame_ends_at_the_next_sync_marker():
     """A frame that lost blocks downstream is handed out short, not padded with its successor.
 
