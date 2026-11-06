@@ -99,7 +99,7 @@ class _ShiftBuffers:
 
 
 class _FrameCutter:
-    """Cut fixed-length frames out of a stream of payload bytes.
+    """Cut frames out of a stream of payload bytes, each from one sync marker to the next.
 
     The awkward parts of reassembly live here so that both readers share them:
     the sync pattern arrives at any of eight bit alignments and may straddle
@@ -112,7 +112,7 @@ class _FrameCutter:
     """
 
     def __init__(self, pattern: bytes, frame_size: int) -> None:
-        """Cut frames of *frame_size* bytes, each opening with *pattern*."""
+        """Cut frames opening with *pattern*, of *frame_size* bytes unless the next one starts sooner."""
         self._pattern = pattern
         self._frame_size = frame_size
         self._seeker = _SyncSeeker(pattern)
@@ -153,7 +153,15 @@ class _FrameCutter:
             self._carry = int(payloads[-1])
 
     def _cut(self) -> Iterator[bytes]:
-        """Yield every whole frame the buffer now holds, resynchronising if needed."""
+        """Yield every frame the buffer now holds, resynchronising if needed.
+
+        A frame ends *frame_size* bytes after its sync marker, or at the next
+        marker if that comes first: a frame that lost blocks on the way down is
+        short, and cutting it at full length would swallow the head of the frame
+        after it and leave the rest of that one without a marker to be found by.
+        The marker is the only evidence used, so one that occurs by chance in a
+        frame's payload splits that frame, as one at a frame start already would.
+        """
         pattern, frame_size = self._pattern, self._frame_size
         buffer = self._buffer
         while len(buffer) >= frame_size:
@@ -196,7 +204,7 @@ def vcdu_payloads(blocks: Iterator[bytes], stride: int, target_vcid: int) -> Ite
 
 
 def vcdu_frames(payloads: Iterator[bytes], pattern: bytes, frame_size: int) -> Iterator[bytes]:
-    """Reassemble VCDU payload chunks into complete fixed-length frames."""
+    """Reassemble VCDU payload chunks into frames, each ending where the next begins."""
     cutter = _FrameCutter(pattern, frame_size)
     for chunk in payloads:
         yield from cutter.feed(chunk)
@@ -387,7 +395,7 @@ class FrameSpec:
     pattern: bytes
     """Sync pattern each frame opens with."""
     frame_size: int
-    """Bytes per reassembled frame."""
+    """Bytes per whole frame. A frame that lost blocks on the way down is shorter."""
 
 
 def iter_frames(

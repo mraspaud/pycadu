@@ -4,8 +4,9 @@ pycadu
 Satellite-agnostic CCSDS/CADU/VCDU frame handling in Python.
 
 Reads raw downlink files containing CADU (Channel Access Data Unit) blocks,
-reassembles VCDU payloads, and yields fixed-length instrument frames delimited
-by a caller-supplied sync pattern.  Works with any CCSDS-compliant downlink:
+reassembles VCDU payloads, and yields instrument frames delimited by a
+caller-supplied sync pattern: a frame runs to the next sync pattern, or to the
+instrument's frame size if that comes first.  Works with any CCSDS-compliant downlink:
 VIIRS, MERSI, MODIS, etc.
 
 Installation
@@ -64,7 +65,8 @@ API
 - ``cadu_blocks(path, stride)`` — stream physical blocks from a file.
 - ``vcdu_payloads(blocks, stride, target_vcid)`` — filter by VCID, strip headers.
 - ``vcdu_frames(payloads, pattern, frame_size)`` — reassemble variable-length
-  chunks into fixed-length frames, handling 0-7 bit shifts automatically.
+  chunks into frames of at most ``frame_size`` bytes, each ending at the next sync
+  pattern, handling 0-7 bit shifts automatically.
 - ``read_frames_batch(path, stride, vcid, pattern, frame_size)`` — memory-mapped
   bulk reader, ~20x faster than the streaming path on large files.
 
