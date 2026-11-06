@@ -115,9 +115,14 @@ class _FrameCutter:
     bytes, and used to differ in how they cut them too.
     """
 
-    def __init__(self, pattern: bytes, frame_size: int) -> None:
-        """Cut frames opening with *pattern*, of *frame_size* bytes unless the next one starts sooner."""
+    def __init__(self, pattern: bytes, frame_size: int, *, counts_lost_blocks: bool = False) -> None:
+        """Cut frames opening with *pattern*, of *frame_size* bytes unless the next one starts sooner.
+
+        *counts_lost_blocks* says the caller reads the VCDU counter and passes on
+        what it skips; without it, a short frame is reported with no count.
+        """
         self._pattern = pattern
+        self._counts_lost_blocks = counts_lost_blocks
         self._frame_size = frame_size
         self._seeker = _SyncSeeker(pattern)
         self._buffer = bytearray()
@@ -186,14 +191,15 @@ class _FrameCutter:
         while self._losses and self._losses[0][0] <= start + frame_length:
             lost += self._losses.popleft()[1]
         if lost or frame_length < self._frame_size:
+            lost_blocks = lost if self._counts_lost_blocks else None
             _log.warning(
-                "frame %d at payload byte %d is %d bytes of %d: %d VCDU block(s) lost",
+                "frame %d at payload byte %d is %d bytes of %d: %s VCDU block(s) lost",
                 self._frame_index,
                 start,
                 frame_length,
                 self._frame_size,
-                lost,
-                extra={"frame_index": self._frame_index, "lost_blocks": lost},
+                "an unknown number of" if lost_blocks is None else lost_blocks,
+                extra={"frame_index": self._frame_index, "lost_blocks": lost_blocks},
             )
         self._frame_index += 1
 
@@ -431,7 +437,7 @@ def _frames_from_block_chunks(
     — a mapping or a stream — is the caller's choice and makes no difference to
     what comes out.
     """
-    cutter = _FrameCutter(pattern, frame_size)
+    cutter = _FrameCutter(pattern, frame_size, counts_lost_blocks=True)
     previous_counter: int | None = None
     for chunk in chunks:
         wanted = chunk[(chunk[:, 5] & np.uint8(0x3F)) == vcid]

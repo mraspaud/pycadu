@@ -203,7 +203,6 @@ def test_a_frame_ends_at_the_next_sync_marker():
     assert found == [short, bytes(whole)]
 
 
-@pytest.mark.xfail(strict=True, reason="a stream without counters reports 0 blocks lost")
 def test_a_short_frame_from_payloads_alone_does_not_claim_a_count(caplog):
     """Payloads stripped of their headers carry no counter, so how much was lost is not known."""
     stream = _frames(1)[: FRAME_SIZE // 2] + _frames(1)
