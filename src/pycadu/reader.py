@@ -405,8 +405,16 @@ def _vcdu_counters(blocks: np.ndarray) -> np.ndarray:
     return (counter[:, 0] << 16) | (counter[:, 1] << 8) | counter[:, 2]
 
 
-def _losses_between(previous_counter: int, counters: np.ndarray) -> list[tuple[int, int]]:
-    """``(payload offset, blocks lost)`` wherever *counters* skip, continuing from *previous_counter*."""
+def _losses_between(previous_counter: int | None, counters: np.ndarray) -> list[tuple[int, int]]:
+    """``(payload offset, blocks lost)`` wherever *counters* skip, continuing from *previous_counter*.
+
+    With no previous counter, the stream starts here and its first block has
+    nothing before it to have lost.
+    """
+    if len(counters) == 0:
+        return []
+    if previous_counter is None:
+        previous_counter = int(counters[0]) - 1
     lost = np.diff(counters, prepend=previous_counter) - 1
     return [(int(block) * VCDU_PAYLOAD_LENGTH, int(lost[block])) for block in np.flatnonzero(lost)]
 
@@ -422,7 +430,7 @@ def _frames_from_block_chunks(
     what comes out.
     """
     cutter = _FrameCutter(pattern, frame_size)
-    previous_counter = -1
+    previous_counter: int | None = None
     for chunk in chunks:
         wanted = chunk[(chunk[:, 5] & np.uint8(0x3F)) == vcid]
         payloads = wanted[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH].copy().ravel()

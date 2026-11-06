@@ -621,7 +621,6 @@ def test_a_frame_that_lost_blocks_says_how_many(caplog):
     assert "1 VCDU block" in warnings[0].getMessage()
 
 
-@pytest.mark.xfail(strict=True, reason="the first block is compared against a counter of -1")
 def test_the_first_block_of_a_stream_has_lost_nothing(caplog):
     """A pass starts wherever the counter happens to be, with no predecessor to have lost."""
     frames, warnings = _frames_and_warnings(_blocks_numbered(list(range(999, 1008))), caplog)
