@@ -1,6 +1,8 @@
 """Generic CADU/VCDU streaming and batch frame reassembly."""
 
 import contextlib
+import logging
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,12 +11,14 @@ from typing import BinaryIO
 import numpy as np
 
 from pycadu.cadu import extract_cadu_data, extract_vcdu_payload, extract_vcid
-from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH
+from pycadu.constants import CADU_DATA_LENGTH, CCSDS_HEADER_LENGTH, VCDU_PAYLOAD_LENGTH
 from pycadu.sync import _build_shifted, find_sync_pattern
 
 #: Physical blocks scanned per vectorised pass. The chunk is what a reading
 #: source holds at once, so it also sets its memory cost.
 BLOCKS_PER_CHUNK = 10_000
+
+_log = logging.getLogger(__name__)
 
 
 class _SyncSeeker:
@@ -120,8 +124,11 @@ class _FrameCutter:
         self._bit_shift: int | None = None
         self._carry = 0
         self._buffers = _ShiftBuffers()
+        self._fed = 0
+        self._losses: deque[tuple[int, int]] = deque()
+        self._frame_index = 0
 
-    def feed(self, payloads) -> Iterator[bytes]:
+    def feed(self, payloads, losses=()) -> Iterator[bytes]:
         """Take one chunk of payload bytes and return the frames it completes.
 
         Absorbing is a plain call rather than part of the generator so that the
@@ -129,7 +136,9 @@ class _FrameCutter:
         mid-pass keeps its locals alive, which would pin a whole chunk for as
         long as the consumer takes over the frame it was handed.
         """
+        self._losses.extend((self._fed + offset, count) for offset, count in losses)
         self._absorb(payloads)
+        self._fed += len(payloads)
         return self._cut()
 
     def _absorb(self, payloads) -> None:
@@ -168,6 +177,17 @@ class _FrameCutter:
             if buffer[: len(pattern)] == pattern:
                 next_sync = buffer.find(pattern, len(pattern), frame_size)
                 frame_end = frame_size if next_sync == -1 else next_sync
+                frame_start = self._fed - (1 if self._bit_shift else 0) - len(buffer)
+                lost = 0
+                while self._losses and self._losses[0][0] <= frame_start + frame_end:
+                    lost += self._losses.popleft()[1]
+                if lost or frame_end < frame_size:
+                    _log.warning(
+                        "frame %d at payload byte %d is %d bytes of %d: %d VCDU block(s) lost",
+                        self._frame_index, frame_start, frame_end, frame_size, lost,
+                        extra={"frame_index": self._frame_index, "lost_blocks": lost},
+                    )
+                self._frame_index += 1
                 yield bytes(buffer[:frame_end])
                 del buffer[:frame_end]
                 continue
@@ -364,14 +384,22 @@ def _frames_from_block_chunks(
     what comes out.
     """
     cutter = _FrameCutter(pattern, frame_size)
+    previous_counter = -1
     for chunk in chunks:
         wanted = chunk[(chunk[:, 5] & np.uint8(0x3F)) == vcid]
         payloads = wanted[:, CCSDS_HEADER_LENGTH:CADU_DATA_LENGTH].copy().ravel()
+        counters = (
+            (wanted[:, 6].astype(np.int64) << 16) | (wanted[:, 7].astype(np.int64) << 8) | wanted[:, 8]
+        )
+        lost = np.diff(counters, prepend=previous_counter) - 1
+        losses = [(int(i) * VCDU_PAYLOAD_LENGTH, int(lost[i])) for i in np.flatnonzero(lost)]
+        if len(counters):
+            previous_counter = int(counters[-1])
         # Let go of the chunk before anything is yielded: it may be a window onto
         # a mapping or a buffer the source is about to close or refill, and a
         # copy of the payloads is all that is wanted from it anyway.
-        chunk = wanted = None
-        frames = cutter.feed(payloads)
+        chunk = wanted = counters = lost = None
+        frames = cutter.feed(payloads, losses)
         # Release the chunk before yielding: a generator suspended while the
         # consumer works on a frame would otherwise pin it for that whole time.
         payloads = None

@@ -481,8 +481,6 @@ def test_a_source_that_breaks_is_reported_however_full_the_queue_is():
     """
     import time
 
-    import pytest
-
     from pycadu.reader import iter_frames_from
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -612,7 +610,6 @@ def _frames_and_warnings(stream: bytes, caplog) -> tuple[list[bytes], list]:
     return frames, [r for r in caplog.records if r.levelname == "WARNING"]
 
 
-@pytest.mark.xfail(strict=True, reason="the VCDU counter is not read, so a lost block goes unreported")
 def test_a_frame_that_lost_blocks_says_how_many(caplog):
     """The VCDU counter is the only witness to a block that never arrived."""
     frames, warnings = _frames_and_warnings(_blocks_numbered([0, 1, 3, 4, 5, 6, 7, 8]), caplog)
