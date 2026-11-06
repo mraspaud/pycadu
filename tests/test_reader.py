@@ -1,6 +1,9 @@
+import io
 import math
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from pycadu.constants import (
     CADU_STRIDE_1024,
@@ -577,3 +580,45 @@ def test_finding_the_sync_does_not_pin_the_chunk_it_was_found_in():
         f"held {held / 1e6:.1f} MB against a budget of {budget / 1e6:.1f} MB — "
         "about a chunk more than the reader has any use for"
     )
+
+
+BLOCKS_PER_FRAME = 3
+
+
+def _blocks_numbered(counters: list[int], vcid: int = 3) -> bytes:
+    """Blocks carrying *counters*, block *n* holding block ``n % 3`` of frame ``n // 3``.
+
+    A counter left out of *counters* is a block lost on the way down: its payload
+    is missing from the stream as well as its number.
+    """
+    out = bytearray()
+    for counter in counters:
+        frame, block = divmod(counter, BLOCKS_PER_FRAME)
+        payload = bytes([0x10 + frame % 0x40]) * VCDU_PAYLOAD_LENGTH
+        if block == 0:
+            payload = PATTERN + payload[len(PATTERN) :]
+        header = CCSDS_SYNC_MARKER + bytes([0x4D, vcid & 0x3F]) + (counter % 2**24).to_bytes(3, "big")
+        out += header.ljust(CCSDS_HEADER_LENGTH, b"\x00") + payload + b"\x00" * RS_PARITY_LENGTH
+    return bytes(out)
+
+
+def _frames_and_warnings(stream: bytes, caplog) -> tuple[list[bytes], list]:
+    """Cut *stream* through the public reader, keeping the warnings it logs."""
+    from pycadu.reader import FrameSpec, iter_frames
+
+    spec = FrameSpec(CADU_STRIDE_1024, 3, PATTERN, BLOCKS_PER_FRAME * VCDU_PAYLOAD_LENGTH)
+    with caplog.at_level("WARNING", logger="pycadu"):
+        frames = list(iter_frames(io.BytesIO(stream), spec, blocks_per_chunk=2))
+    return frames, [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.xfail(strict=True, reason="the VCDU counter is not read, so a lost block goes unreported")
+def test_a_frame_that_lost_blocks_says_how_many(caplog):
+    """The VCDU counter is the only witness to a block that never arrived."""
+    frames, warnings = _frames_and_warnings(_blocks_numbered([0, 1, 3, 4, 5, 6, 7, 8]), caplog)
+
+    assert [len(f) for f in frames] == [2 * VCDU_PAYLOAD_LENGTH] + [3 * VCDU_PAYLOAD_LENGTH] * 2
+    assert len(warnings) == 1, [w.getMessage() for w in warnings]
+    assert (warnings[0].frame_index, warnings[0].lost_blocks) == (0, 1)
+    assert "frame 0" in warnings[0].getMessage()
+    assert "1 VCDU block" in warnings[0].getMessage()
